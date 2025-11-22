@@ -5,21 +5,31 @@ from collections import defaultdict
 from utils import format_na, truncate_text
 # Import client and monitor functions
 from llm_clients import (
-    query_ollama, query_gemini, get_local_ollama_models,
-    get_ollama_running_models, unload_ollama_model # Added unload function
+    query_ollama, query_gemini, query_vllm, # --- VLLM ADDITION ---
+    get_local_ollama_models, get_ollama_running_models, unload_ollama_model
 )
 from evaluation import evaluate_response
-from system_monitor import get_ollama_pids, get_combined_rss, get_gpu_memory_usage
+from system_monitor import get_ollama_pids, get_vllm_pids, get_combined_rss, get_gpu_memory_usage # --- VLLM ADDITION ---
 
 # --- Constants ---
 UNLOAD_WAIT_SECONDS = 5 # Time to wait after unload requests before measuring RAM/GPU
 INTER_UNLOAD_DELAY = 0.5 # Small delay between unload API calls
 
+# --- Model Provider Identification ---
+def get_provider_from_model_name(model_name):
+    """Determines the provider based on model name convention."""
+    if model_name.startswith("vllm/"):
+        return "vllm"
+    elif model_name.startswith("gemini-") or model_name.startswith("models/"):
+        return "gemini"
+    elif model_name.startswith("ollama/"):
+        return "ollama"
+    else:
+        # Default assumption if no prefix
+        return "ollama"
+
 def run_benchmark_set(benchmark_name, model_list, tasks, task_categories_map, runtime_config):
     """Runs a set of tasks across specified models and collects results."""
-    # Args: ... (same as before) ...
-    # Returns: dict: Nested dictionary containing results per model and task, plus summaries.
-
     print(f"\n--- Benchmark Set: {benchmark_name} ---")
     if not model_list: print("[WARN] No models specified."); return {}
     if not tasks: print("[WARN] No tasks selected."); return {}
@@ -27,46 +37,59 @@ def run_benchmark_set(benchmark_name, model_list, tasks, task_categories_map, ru
     results = {}
     task_lookup = {task['name']: task for task in tasks}
 
-    # --- Initial Resource State (Ollama) ---
+    # --- Initial Resource State ---
+    # MODIFIED FOR VLLM: Check for any local provider (Ollama or vLLM)
+    ollama_models_present = any(get_provider_from_model_name(m) == "ollama" for m in model_list)
+    vllm_models_present = any(get_provider_from_model_name(m) == "vllm" for m in model_list)
+    local_provider_present = ollama_models_present or vllm_models_present
+
     ollama_pids = []
+    vllm_pids = [] # --- VLLM ADDITION ---
+    combined_pids = []
     initial_ram_bytes = 0
     initial_gpu_mem_bytes = 0
-    ollama_in_run = any(not (m.startswith("gemini-") or m.startswith("models/")) for m in model_list)
 
-    if ollama_in_run and (runtime_config.ram_monitor_enabled or runtime_config.gpu_monitor_enabled):
-        # --- Attempt to Unload Existing Models ---
-        print("[INFO] Checking for currently running models in Ollama...")
-        running_models_before = get_ollama_running_models(runtime_config)
+    if local_provider_present and (runtime_config.ram_monitor_enabled or runtime_config.gpu_monitor_enabled):
+        # --- Attempt to Unload Existing Ollama Models (Only if Ollama is being tested) ---
+        if ollama_models_present:
+            print("[INFO] Checking for currently running models in Ollama...")
+            running_models_before = get_ollama_running_models(runtime_config)
 
-        if running_models_before is None:
-            print("[WARN] Could not determine running Ollama models due to API error. Baseline measurement might be affected.")
-        elif not running_models_before:
-            print("[INFO] No models appear to be loaded in Ollama memory.")
-        else:
-            print(f"[INFO] Attempting to unload currently running models: {running_models_before}")
-            unload_success_count = 0
-            unload_fail_count = 0
-            for model_to_unload in running_models_before:
-                if unload_ollama_model(model_to_unload, runtime_config):
-                    unload_success_count += 1
-                else:
-                    unload_fail_count += 1
-                time.sleep(INTER_UNLOAD_DELAY) # Small pause between unload calls
+            if running_models_before is None:
+                print("[WARN] Could not determine running Ollama models due to API error. Baseline measurement might be affected.")
+            elif not running_models_before:
+                print("[INFO] No models appear to be loaded in Ollama memory.")
+            else:
+                print(f"[INFO] Attempting to unload currently running Ollama models: {running_models_before}")
+                unload_success_count = 0
+                unload_fail_count = 0
+                for model_to_unload in running_models_before:
+                    if unload_ollama_model(model_to_unload, runtime_config):
+                        unload_success_count += 1
+                    else:
+                        unload_fail_count += 1
+                    time.sleep(INTER_UNLOAD_DELAY) # Small pause between unload calls
 
-            print(f"[INFO] Unload requests sent ({unload_success_count} success, {unload_fail_count} fail). Waiting {UNLOAD_WAIT_SECONDS}s for memory release...")
-            time.sleep(UNLOAD_WAIT_SECONDS)
-            # Optional: Could call get_ollama_running_models again here to verify, but adds delay
+                print(f"[INFO] Ollama unload requests sent ({unload_success_count} success, {unload_fail_count} fail). Waiting {UNLOAD_WAIT_SECONDS}s for memory release...")
+                time.sleep(UNLOAD_WAIT_SECONDS)
 
         # --- Measure Baseline ---
-        print("[INFO] Measuring initial RAM/GPU state...")
+        print("[INFO] Measuring initial RAM/GPU state for local providers...")
         if runtime_config.ram_monitor_enabled:
             if runtime_config.psutil_available:
-                ollama_pids = get_ollama_pids(runtime_config.psutil, runtime_config)
-                if ollama_pids:
-                    initial_ram_bytes = get_combined_rss(ollama_pids, runtime_config.psutil)
-                    print(f"[INFO] Initial Ollama RAM: {format_na(initial_ram_bytes / (1024*1024), ' MB')} (PIDs: {ollama_pids})")
+                # Get PIDs for each provider if present
+                if ollama_models_present:
+                    ollama_pids = get_ollama_pids(runtime_config.psutil, runtime_config)
+                if vllm_models_present:
+                    vllm_pids = get_vllm_pids(runtime_config.psutil, runtime_config) # --- VLLM ADDITION ---
+
+                combined_pids = list(set(ollama_pids + vllm_pids)) # Unique PIDs
+
+                if combined_pids:
+                    initial_ram_bytes = get_combined_rss(combined_pids, runtime_config.psutil)
+                    print(f"[INFO] Initial Combined RAM: {format_na(initial_ram_bytes / (1024*1024), ' MB')} (PIDs: {combined_pids})")
                 else:
-                    print("[WARN] Initial Ollama RAM: Could not find PIDs. RAM Delta metrics will be inaccurate.")
+                    print("[WARN] Initial RAM: Could not find PIDs for local providers. RAM Delta metrics will be inaccurate.")
             else:
                  print("[INFO] RAM monitoring enabled but psutil unavailable. Skipping RAM measurement.")
 
@@ -79,30 +102,33 @@ def run_benchmark_set(benchmark_name, model_list, tasks, task_categories_map, ru
             elif runtime_config.gpu_count == 0:
                  print("[INFO] GPU monitoring enabled but no NVIDIA GPUs detected. Skipping GPU measurement.")
 
-
     initial_ram_mb = initial_ram_bytes / (1024*1024) if initial_ram_bytes > 0 else 0
     initial_gpu_mem_mb = initial_gpu_mem_bytes / (1024*1024) if initial_gpu_mem_bytes > 0 else 0
 
     # --- Loop Through Models ---
-    # (The rest of the function loop remains the same as the previous version)
-    local_ollama_models_cache = None
+    local_ollama_models_cache = None # Cache for Ollama model check
     general_models_to_run = set(runtime_config.models_to_benchmark)
     code_models_to_run = set(runtime_config.code_models_to_benchmark)
 
-    for idx, model_name in enumerate(model_list):
-        is_gemini = model_name.startswith("gemini-") or model_name.startswith("models/")
-        provider = "gemini" if is_gemini else "ollama"
-        print(f"\n>>> Model {idx+1}/{len(model_list)}: {model_name} ({provider}) <<<")
+    for idx, model_name_raw in enumerate(model_list):
+        # --- VLLM MODIFICATION: Determine provider and clean model name ---
+        provider = get_provider_from_model_name(model_name_raw)
+        # Use the raw name for display, cleaned name for API calls if needed
+        model_name_for_api = model_name_raw.split(f'{provider}/', 1)[-1] if model_name_raw.startswith(f'{provider}/') else model_name_raw
+
+        print(f"\n>>> Model {idx+1}/{len(model_list)}: {model_name_raw} ({provider}) <<<")
 
         model_results = {}
         model_summary = {
-            "model_name": model_name, "provider": provider, "status": "Pending",
+            "model_name": model_name_raw, # Store the original name with prefix
+            "provider": provider, "status": "Pending",
             "accuracy": 0.0, "correct_count": 0, "success_count": 0, "processed_count": 0,
             "api_errors": 0, "error_rate": 0.0, "avg_time_per_task": 0.0, "total_time": 0.0,
-            "partial_score_avg": None, "scored_task_count": 0, "tokens_per_sec_avg": None,
-            "peak_ram_mb": None, "initial_ram_mb": initial_ram_mb,
+            "partial_score_avg": None, "scored_task_count": 0,
+            "tokens_per_sec_avg": None, # Applicable mainly to Ollama
+            "peak_ram_mb": None, "initial_ram_mb": initial_ram_mb, # Store initial baseline
             "delta_ram_mb": None,
-            "peak_gpu_mem_mb": None, "initial_gpu_mem_mb": initial_gpu_mem_mb,
+            "peak_gpu_mem_mb": None, "initial_gpu_mem_mb": initial_gpu_mem_mb, # Store initial baseline
             "delta_gpu_mem_mb": None,
             "per_type": defaultdict(lambda: {
                 "count": 0, "correct": 0, "api_errors": 0, "score_sum": 0.0, "score_count": 0,
@@ -110,25 +136,34 @@ def run_benchmark_set(benchmark_name, model_list, tasks, task_categories_map, ru
             })
         }
 
-        # Model Availability Check...
+        # --- Model Availability Check ---
         if provider == "ollama":
             if local_ollama_models_cache is None:
                  local_ollama_models_cache = get_local_ollama_models(runtime_config)
                  if local_ollama_models_cache is None:
-                     print(f"  [SKIP MODEL] Cannot verify local Ollama models due to API connection error. Skipping {model_name}.")
+                     print(f"  [SKIP MODEL] Cannot verify local Ollama models due to API connection error. Skipping {model_name_raw}.")
                      model_summary["status"] = "Skipped - Ollama API Error"
-                     results[model_name] = {"_summary": model_summary}
+                     results[model_name_raw] = {"_summary": model_summary}
                      continue
-            if model_name not in local_ollama_models_cache:
-                 print(f"  [SKIP MODEL] Model '{model_name}' not found locally and not pulled. Skipping.")
+            # Use model_name_for_api for the check
+            if model_name_for_api not in local_ollama_models_cache:
+                 print(f"  [SKIP MODEL] Ollama model '{model_name_for_api}' not found locally and not pulled. Skipping.")
                  model_summary["status"] = "Skipped - Model Not Found"
-                 results[model_name] = {"_summary": model_summary}
+                 results[model_name_raw] = {"_summary": model_summary}
                  continue
         elif provider == "gemini" and not runtime_config.gemini_key:
-            print(f"  [SKIP MODEL] Gemini model '{model_name}' specified but no API key provided. Skipping.")
+            print(f"  [SKIP MODEL] Gemini model '{model_name_raw}' specified but no API key provided. Skipping.")
             model_summary["status"] = "Skipped - No API Key"
-            results[model_name] = {"_summary": model_summary}
+            results[model_name_raw] = {"_summary": model_summary}
             continue
+        elif provider == "vllm":
+             # Basic check: ensure host URL is configured
+             if not runtime_config.vllm_host_url:
+                 print(f"  [SKIP MODEL] vLLM model '{model_name_raw}' specified but vLLM Host URL not configured. Skipping.")
+                 model_summary["status"] = "Skipped - No vLLM Host"
+                 results[model_name_raw] = {"_summary": model_summary}
+                 continue
+             # We assume the model exists on the vLLM server; API call will fail if not.
 
         # Per-Model Tracking...
         total_model_time = 0.0
@@ -138,8 +173,8 @@ def run_benchmark_set(benchmark_name, model_list, tasks, task_categories_map, ru
         tasks_processed_count = 0
         model_api_errors = 0
         successful_api_calls = 0
-        sum_tokps = 0.0
-        count_tokps = 0
+        sum_tokps = 0.0 # Only relevant for Ollama
+        count_tokps = 0 # Only relevant for Ollama
         peak_ram_bytes = initial_ram_bytes
         peak_gpu_mem_bytes = initial_gpu_mem_bytes
 
@@ -154,8 +189,9 @@ def run_benchmark_set(benchmark_name, model_list, tasks, task_categories_map, ru
             if not prompt.strip(): continue
             if t_type.startswith("yaml_") and not runtime_config.pyyaml_available: continue
             if task.get("evaluation_method") == "semantic" and not runtime_config.sentence_transformers_available: continue
-            if is_code_task and model_name not in code_models_to_run: continue
-            if not is_code_task and model_name not in general_models_to_run: continue
+            # Check against raw model name (with prefix) for filtering
+            if is_code_task and model_name_raw not in code_models_to_run: continue
+            if not is_code_task and model_name_raw not in general_models_to_run: continue
 
             # Run Task...
             print(f"  Running Task {tidx+1}/{len(tasks)}: {t_name} ({t_type})")
@@ -163,31 +199,34 @@ def run_benchmark_set(benchmark_name, model_list, tasks, task_categories_map, ru
             tasks_processed_count += 1
             model_summary["per_type"][t_type]["count"] += 1
 
-            # Resource Monitoring (Before Query)...
+            # Resource Monitoring (Before Query) - Use COMBINED PIDs for local providers
             current_ram_before = 0
             current_gpu_before = 0
-            if provider == "ollama":
-                if runtime_config.ram_monitor_enabled and runtime_config.psutil_available and ollama_pids:
-                    current_ram_before = get_combined_rss(ollama_pids, runtime_config.psutil)
+            if provider in ["ollama", "vllm"]: # Check if it's a local provider
+                if runtime_config.ram_monitor_enabled and runtime_config.psutil_available and combined_pids:
+                    current_ram_before = get_combined_rss(combined_pids, runtime_config.psutil)
                     peak_ram_bytes = max(peak_ram_bytes, current_ram_before)
                 if runtime_config.gpu_monitor_enabled and runtime_config.pynvml_available and runtime_config.gpu_count > 0:
                     current_gpu_before = get_gpu_memory_usage(runtime_config.pynvml, 0)
                     peak_gpu_mem_bytes = max(peak_gpu_mem_bytes, current_gpu_before)
 
-            # Query Model...
+            # --- Query Model (Dispatch based on provider) ---
             start_query_time = time.time()
+            resp_text, duration_api, tokps_api, error = "", 0.0, None, "Provider not matched"
             if provider == "gemini":
-                resp_text, duration_api, tokps_api, error = query_gemini(model_name, prompt, runtime_config)
-            else: # Ollama
-                resp_text, duration_api, tokps_api, error = query_ollama(model_name, prompt, runtime_config)
-            query_duration = time.time() - start_query_time
+                resp_text, duration_api, tokps_api, error = query_gemini(model_name_for_api, prompt, runtime_config)
+            elif provider == "vllm":
+                resp_text, duration_api, tokps_api, error = query_vllm(model_name_for_api, prompt, runtime_config) # Pass cleaned name
+            else: # Default to Ollama
+                resp_text, duration_api, tokps_api, error = query_ollama(model_name_for_api, prompt, runtime_config) # Pass cleaned name
+            query_duration = time.time() - start_query_time # Use actual wall-clock time
             total_model_time += query_duration
             model_summary["per_type"][t_type]["time_sum"] += query_duration
 
-            # Resource Monitoring (After Query)...
-            if provider == "ollama":
-                if runtime_config.ram_monitor_enabled and runtime_config.psutil_available and ollama_pids:
-                    current_ram_after = get_combined_rss(ollama_pids, runtime_config.psutil)
+            # Resource Monitoring (After Query) - Use COMBINED PIDs
+            if provider in ["ollama", "vllm"]:
+                if runtime_config.ram_monitor_enabled and runtime_config.psutil_available and combined_pids:
+                    current_ram_after = get_combined_rss(combined_pids, runtime_config.psutil)
                     peak_ram_bytes = max(peak_ram_bytes, current_ram_after)
                 if runtime_config.gpu_monitor_enabled and runtime_config.pynvml_available and runtime_config.gpu_count > 0:
                     current_gpu_after = get_gpu_memory_usage(runtime_config.pynvml, 0)
@@ -196,6 +235,7 @@ def run_benchmark_set(benchmark_name, model_list, tasks, task_categories_map, ru
             # Process Result...
             task_result_data = {
                 "response": resp_text, "error": error, "duration": query_duration,
+                # Only store tok/s if provider is Ollama and value is valid
                 "tokens_per_sec": tokps_api if provider == "ollama" and tokps_api is not None and tokps_api > 0 else None,
                 "metric": None, "details": "N/A", "task_type": t_type
             }
@@ -215,7 +255,7 @@ def run_benchmark_set(benchmark_name, model_list, tasks, task_categories_map, ru
                 try:
                     metric, details = evaluate_response(task, resp_text, runtime_config)
                 except Exception as eval_e:
-                     print(f"    [Internal Eval Error] Task '{t_name}', Model '{model_name}': {eval_e}")
+                     print(f"    [Internal Eval Error] Task '{t_name}', Model '{model_name_raw}': {eval_e}")
                      print(traceback.format_exc())
                      metric = False
                      details = f"Internal evaluation error: {eval_e}"
@@ -245,20 +285,21 @@ def run_benchmark_set(benchmark_name, model_list, tasks, task_categories_map, ru
                     task_result_data["details"] += " (Unexpected metric type)"
                     is_pass = False
 
-                if task_result_data["tokens_per_sec"]:
+                # Only accumulate tok/s for Ollama
+                if provider == "ollama" and task_result_data["tokens_per_sec"]:
                     sum_tokps += task_result_data["tokens_per_sec"]
                     count_tokps += 1
                     model_summary["per_type"][t_type]["tokps_sum"] += task_result_data["tokens_per_sec"]
                     model_summary["per_type"][t_type]["tokps_count"] += 1
 
             print(f"    Time: {query_duration:.2f}s", end="")
-            if task_result_data["tokens_per_sec"]:
+            if task_result_data["tokens_per_sec"]: # Only print if available (Ollama)
                 print(f" | Tok/s: {task_result_data['tokens_per_sec']:.1f}")
             else:
-                print()
+                print() # Newline for non-Ollama
 
             model_results[t_name] = task_result_data
-            time.sleep(0.05)
+            time.sleep(0.05) # Keep small delay
 
         # --- Calculate Model Summary Stats ---
         model_summary["status"] = "Completed"
@@ -278,10 +319,14 @@ def run_benchmark_set(benchmark_name, model_list, tasks, task_categories_map, ru
         model_summary["scored_task_count"] = tasks_with_scores
         model_summary["total_time"] = total_model_time
 
+        # Provider-specific metrics
         if provider == "ollama":
             if count_tokps > 0: model_summary["tokens_per_sec_avg"] = sum_tokps / count_tokps
+            # RAM/GPU handled below for all local providers
+
+        # RAM/GPU metrics for local providers
+        if provider in ["ollama", "vllm"]:
             if runtime_config.ram_monitor_enabled and runtime_config.psutil_available:
-                 # Use max(initial, peak) for peak_ram_mb to handle cases where usage might dip below initial
                  model_summary["peak_ram_mb"] = max(initial_ram_mb, peak_ram_bytes / (1024*1024))
                  model_summary["delta_ram_mb"] = model_summary["peak_ram_mb"] - initial_ram_mb if model_summary["peak_ram_mb"] is not None else None
             if runtime_config.gpu_monitor_enabled and runtime_config.pynvml_available:
@@ -296,25 +341,28 @@ def run_benchmark_set(benchmark_name, model_list, tasks, task_categories_map, ru
                  stats["avg_time"] = stats["time_sum"] / count if count > 0 else 0.0
                  stats["accuracy"] = (stats["correct"] / success_calls) * 100 if success_calls > 0 else 0.0
                  stats["avg_score"] = stats["score_sum"] / stats["score_count"] if stats["score_count"] > 0 else None
+                 # Only calculate avg_tokps if it's Ollama
                  if provider == "ollama" and stats["tokps_count"] > 0:
                      stats["avg_tokps"] = stats["tokps_sum"] / stats["tokps_count"]
                  else:
                      stats["avg_tokps"] = None
 
-
         model_results["_summary"] = model_summary
-        results[model_name] = model_results
+        results[model_name_raw] = model_results # Use raw name as key
 
         # Print Model Summary...
-        print(f"\n  --- Model Summary: {model_name} ---")
+        print(f"\n  --- Model Summary: {model_name_raw} ({provider}) ---")
         print(f"    Status: {model_summary['status']}")
         print(f"    Tasks Processed: {tasks_processed_count}, API Errors: {model_api_errors} ({model_summary['error_rate']:.1f}%)")
         print(f"    Accuracy (on {successful_api_calls} success calls): {model_summary['accuracy']:.1f}% ({correct_tasks} correct)")
         if model_summary['partial_score_avg'] is not None:
             print(f"    Avg Score (on {tasks_with_scores} scored tasks): {model_summary['partial_score_avg']:.1f}%")
         print(f"    Avg Time/Task: {model_summary['avg_time_per_task']:.2f}s (Total: {total_model_time:.1f}s)")
+        # Provider-specific print
         if provider == "ollama":
             print(f"    Avg Tok/s (on {count_tokps} tasks): {format_na(model_summary['tokens_per_sec_avg'], precision=1)}")
+        # RAM/GPU print for local providers
+        if provider in ["ollama", "vllm"]:
             if runtime_config.ram_monitor_enabled: print(f"    Peak RAM: {format_na(model_summary['peak_ram_mb'], ' MB')} (Delta vs initial: {format_na(model_summary['delta_ram_mb'], ' MB')})")
             if runtime_config.gpu_monitor_enabled: print(f"    Peak GPU Mem: {format_na(model_summary['peak_gpu_mem_mb'], ' MB')} (Delta vs initial: {format_na(model_summary['delta_gpu_mem_mb'], ' MB')})")
 

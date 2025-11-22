@@ -6,6 +6,7 @@ import sys
 import time
 import re
 import traceback
+import openai # --- VLLM ADDITION ---
 
 # Constants like specific API paths (relative to base URL)
 OLLAMA_GENERATE_PATH = "/api/generate"
@@ -14,6 +15,7 @@ OLLAMA_PULL_PATH = "/api/pull"
 OLLAMA_SHOW_PATH = "/api/show"
 OLLAMA_PS_PATH = "/api/ps"
 GEMINI_API_GENERATE_CONTENT = ":generateContent"
+# VLLM uses OpenAI compatible paths, no need for constants here
 
 def _get_ollama_url(runtime_config, path):
     """Constructs the full Ollama API URL."""
@@ -25,10 +27,14 @@ def _get_gemini_url(runtime_config, model_name):
     base = runtime_config.gemini_api_url_base.rstrip('/')
     return f"{base}/{model_name_part}{GEMINI_API_GENERATE_CONTENT}?key={runtime_config.gemini_key}"
 
+# --- VLLM ADDITION: Helper for vLLM URL (though often just base_url) ---
+# def _get_vllm_url(runtime_config, path=""):
+#     """Constructs the full vLLM API URL (usually just base + path)."""
+#     return f"{runtime_config.vllm_host_url}{path}"
+
 
 def query_ollama(model_name, prompt, runtime_config):
     """Sends a prompt to a local Ollama model with retry logic."""
-    # (Implementation remains the same as previous version)
     url = _get_ollama_url(runtime_config, OLLAMA_GENERATE_PATH)
     payload = {
         "model": model_name,
@@ -136,7 +142,6 @@ def query_ollama(model_name, prompt, runtime_config):
 
 def query_gemini(model_name, prompt, runtime_config):
     """Sends a prompt to Google's Gemini API with retry logic."""
-    # (Implementation remains the same as previous version)
     if not runtime_config.gemini_key:
         return "", 0.0, None, "Gemini API Key not provided"
 
@@ -156,7 +161,7 @@ def query_gemini(model_name, prompt, runtime_config):
 
     generated_text = ""
     duration = 0.0
-    tokens_per_sec = None
+    tokens_per_sec = None # Gemini API doesn't provide this directly
     final_error = None
     attempt_details = []
     request_timeout = runtime_config.request_timeout
@@ -280,19 +285,129 @@ def query_gemini(model_name, prompt, runtime_config):
     return generated_text, duration, tokens_per_sec, final_error
 
 
+# --- VLLM ADDITION START ---
+def query_vllm(model_name, prompt, runtime_config):
+    """Sends a prompt to a vLLM OpenAI-compatible server with retry logic."""
+    if not runtime_config.openai_available:
+        return "", 0.0, None, "OpenAI library not available for vLLM client."
+    if not runtime_config.vllm_host_url:
+        return "", 0.0, None, "vLLM Host URL not configured."
+
+    # Extract the actual model identifier if a 'vllm/' prefix was used
+    model_identifier = model_name.split('vllm/', 1)[-1] if model_name.startswith('vllm/') else model_name
+
+    try:
+        # Initialize OpenAI client pointing to the vLLM server
+        client = runtime_config.openai.OpenAI(
+            base_url=runtime_config.vllm_host_url,
+            api_key=runtime_config.vllm_api_key or "not-needed", # API key might not be needed for local vLLM
+            timeout=runtime_config.request_timeout + 5, # Add buffer to client timeout
+        )
+    except Exception as e:
+        return "", 0.0, None, f"Failed to initialize OpenAI client for vLLM: {e}"
+
+    payload = {
+        "model": model_identifier,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.0,
+        # Add other parameters like max_tokens if needed
+        # "max_tokens": 8192,
+    }
+    if runtime_config.verbose: print(f"    [Verbose] vLLM Payload to {runtime_config.vllm_host_url}: {json.dumps(payload, indent=2)}")
+
+    generated_text = ""
+    duration = 0.0
+    tokens_per_sec = None # vLLM API doesn't provide token timing directly
+    final_error = None
+    attempt_details = []
+    max_retries = runtime_config.max_retries
+    retry_delay = runtime_config.retry_delay
+
+    for attempt in range(max_retries + 1):
+        start_time = time.time()
+        current_error = None
+        completion = None
+        try:
+            completion = client.chat.completions.create(**payload)
+            duration = time.time() - start_time
+
+            if completion.choices:
+                generated_text = completion.choices[0].message.content.strip()
+                generated_text = re.sub(r'^```[a-zA-Z]*(?:\n)?|(?:\n)?```$', '', generated_text).strip()
+
+            finish_reason = completion.choices[0].finish_reason if completion.choices else "unknown"
+            if finish_reason not in ["stop", "length"]: # length means max_tokens hit
+                 print(f"    [API Warning] vLLM finish reason for {model_name}: {finish_reason}")
+                 # Handle potential vLLM specific reasons if needed
+
+            attempt_details.append(f"Attempt {attempt+1}: Success")
+            if runtime_config.verbose: print(f"    [Verbose] vLLM Raw Response (Success): {completion.model_dump_json(indent=2)}")
+            final_error = None
+            break # Success
+
+        except openai.APITimeoutError as e:
+            current_error = f"Timeout after {runtime_config.request_timeout}s connecting to vLLM: {e}"
+            attempt_details.append(f"Attempt {attempt+1}: Failed ({current_error})")
+            if attempt < max_retries:
+                 print(f"    [Retryable Error] Request timed out. Retrying in {retry_delay}s... ({attempt+1}/{max_retries})")
+                 time.sleep(retry_delay)
+                 continue
+            else: break
+        except openai.APIConnectionError as e:
+            current_error = f"Connection error to vLLM at {runtime_config.vllm_host_url}: {e}"
+            attempt_details.append(f"Attempt {attempt+1}: Failed ({current_error})")
+            if attempt < max_retries:
+                 print(f"    [Retryable Error] Connection error. Retrying in {retry_delay}s... ({attempt+1}/{max_retries})")
+                 time.sleep(retry_delay)
+                 continue
+            else: break
+        except openai.APIStatusError as e: # Catches 4xx/5xx errors
+             status_code = e.status_code
+             err_message = str(e)
+             current_error = f"vLLM API Error HTTP {status_code}: {err_message}"
+             attempt_details.append(f"Attempt {attempt+1}: Failed ({current_error})")
+             if status_code in [429, 500, 503] and attempt < max_retries: # Retry on these specific errors
+                 print(f"    [Retryable Error] {current_error}. Retrying in {retry_delay}s... ({attempt+1}/{max_retries})")
+                 time.sleep(retry_delay)
+                 continue
+             else: # Non-retryable API error (e.g., 400, 404) or max retries reached
+                 break
+        except openai.APIError as e: # Catch-all for other OpenAI lib errors
+            current_error = f"Unexpected OpenAI API error during vLLM query: {type(e).__name__}: {e}"
+            attempt_details.append(f"Attempt {attempt+1}: Failed ({current_error})")
+            if runtime_config.verbose: traceback.print_exc()
+            break
+        except Exception as e: # Catch other unexpected errors
+            current_error = f"Unexpected error during vLLM query: {type(e).__name__}: {e}"
+            attempt_details.append(f"Attempt {attempt+1}: Failed ({current_error})")
+            if runtime_config.verbose: traceback.print_exc()
+            break
+        finally:
+             if current_error and attempt == max_retries:
+                 duration = time.time() - start_time
+             final_error = current_error
+
+    if final_error and len(attempt_details) > 1:
+         final_error = f"{final_error} (After {len(attempt_details)} attempts: {'; '.join(attempt_details)})"
+    elif final_error:
+         final_error = f"{final_error} (Attempt 1 failed)"
+
+    return generated_text, duration, tokens_per_sec, final_error
+# --- VLLM ADDITION END ---
+
+
 def pull_ollama_model(model_name, runtime_config):
     """Attempts to pull an Ollama model using the API."""
-    # (Implementation remains the same as previous version)
     url = _get_ollama_url(runtime_config, OLLAMA_PULL_PATH)
     pull_timeout = 3600
 
-    print(f"Pulling model '{model_name}' from remote registry (via {url})... Timeout: {pull_timeout}s. This may take a while.")
+    print(f"Pulling Ollama model '{model_name}' from remote registry (via {url})... Timeout: {pull_timeout}s. This may take a while.")
     try:
         with requests.post(url, json={"name": model_name, "stream": True}, stream=True, timeout=pull_timeout) as resp:
             if resp.status_code != 200:
                 try: detail = resp.json().get("error", f"HTTP {resp.status_code}")
                 except: detail = resp.text[:200]
-                print(f"[ERROR] Pull failed for '{model_name}': {detail}")
+                print(f"[ERROR] Ollama pull failed for '{model_name}': {detail}")
                 return False
 
             last_status_line = ""
@@ -310,25 +425,24 @@ def pull_ollama_model(model_name, runtime_config):
                              print(f"  Progress: {prog_detail}", end='\r')
                              last_status_line = prog_detail
                     except json.JSONDecodeError: pass
-                    except Exception as stream_err: print(f"\n[WARN] Error processing pull stream line: {stream_err}")
+                    except Exception as stream_err: print(f"\n[WARN] Error processing Ollama pull stream line: {stream_err}")
 
-            print(f"\n[SUCCESS] Pull stream completed for model '{model_name}'.")
+            print(f"\n[SUCCESS] Ollama pull stream completed for model '{model_name}'.")
             return True
 
     except requests.exceptions.Timeout:
-        print(f"\n[ERROR] Pull request for '{model_name}' timed out after {pull_timeout}s.")
+        print(f"\n[ERROR] Ollama pull request for '{model_name}' timed out after {pull_timeout}s.")
         return False
     except requests.exceptions.ConnectionError as e:
-         print(f"\n[ERROR] Connection error during pull for '{model_name}' to {url}: {e}")
+         print(f"\n[ERROR] Connection error during Ollama pull for '{model_name}' to {url}: {e}")
          return False
     except Exception as e:
-        print(f"\n[ERROR] Pull request failed for '{model_name}': {e}")
+        print(f"\n[ERROR] Ollama pull request failed for '{model_name}': {e}")
         return False
 
 
 def get_local_ollama_models(runtime_config):
     """Fetches the list of locally available Ollama models via API."""
-    # (Implementation remains the same as previous version)
     url = _get_ollama_url(runtime_config, OLLAMA_MODELS_PATH)
     local_models = set()
     try:
@@ -340,24 +454,25 @@ def get_local_ollama_models(runtime_config):
                 local_models.add(m_name)
         return local_models
     except requests.exceptions.ConnectionError:
+        # Return None to indicate connection failure, distinct from empty list
+        print(f"[WARN] get_local_ollama_models: Could not connect to Ollama API at {url}.")
         return None
     except requests.exceptions.RequestException as e:
         print(f"[WARN] get_local_ollama_models: API request failed to {url}: {e}")
-        return set()
+        return set() # Return empty set on other errors, assuming API reachable but failed
     except Exception as e:
         print(f"[WARN] get_local_ollama_models: Failed to parse models list from {url}: {e}")
         return set()
 
 def get_ollama_running_models(runtime_config):
     """Gets the list of models currently loaded in Ollama memory via /api/ps."""
-    # (Implementation remains the same as previous version)
     url = _get_ollama_url(runtime_config, OLLAMA_PS_PATH)
     running_models = []
     try:
         r = requests.get(url, timeout=5)
         if r.status_code == 404:
             print(f"[INFO] Ollama API endpoint {OLLAMA_PS_PATH} not found. Cannot check running models.")
-            return []
+            return [] # Treat as empty list if endpoint doesn't exist
         r.raise_for_status()
         data = r.json()
         models_info = data.get("models", [])
@@ -367,19 +482,17 @@ def get_ollama_running_models(runtime_config):
         return running_models
     except requests.exceptions.ConnectionError:
         print(f"[WARN] get_ollama_running_models: Could not connect to Ollama API at {url}.")
-        return None
+        return None # Indicate connection failure
     except requests.exceptions.RequestException as e:
         print(f"[WARN] get_ollama_running_models: API request failed to {url}: {e}")
-        return None
+        return None # Indicate API error
     except Exception as e:
         print(f"[WARN] get_ollama_running_models: Failed to parse running models list from {url}: {e}")
-        return None
+        return None # Indicate parsing error
+
 
 def unload_ollama_model(model_name, runtime_config):
     """Sends a request to Ollama to unload a specific model (using keep_alive=0)."""
-    # Args: model_name (str): The model tag to unload.
-    #       runtime_config (RuntimeConfig): Config object for URL and timeout.
-    # Returns: bool: True if the request was sent successfully (status 200), False otherwise.
     url = _get_ollama_url(runtime_config, OLLAMA_GENERATE_PATH)
     payload = {
         "model": model_name,
@@ -387,38 +500,36 @@ def unload_ollama_model(model_name, runtime_config):
         "keep_alive": 0,    # Request unload
         "stream": False
     }
-    # Use a shorter timeout for unload requests? Default request timeout might be too long.
     unload_timeout = 15 # seconds
 
-    if runtime_config.verbose: print(f"    [Verbose] Sending unload request for {model_name} to {url}")
+    if runtime_config.verbose: print(f"    [Verbose] Sending Ollama unload request for {model_name} to {url}")
 
     try:
         resp = requests.post(url, json=payload, timeout=unload_timeout)
         if resp.status_code == 200:
-            if runtime_config.verbose: print(f"    [Verbose] Unload request for {model_name} successful (status 200).")
+            if runtime_config.verbose: print(f"    [Verbose] Ollama unload request for {model_name} successful (status 200).")
             return True
         elif resp.status_code == 404:
-             # Model might already be unloaded or never existed
-             if runtime_config.verbose: print(f"    [Verbose] Model {model_name} not found during unload attempt (status 404). Assuming unloaded.")
+             if runtime_config.verbose: print(f"    [Verbose] Ollama model {model_name} not found during unload attempt (status 404). Assuming unloaded.")
              return True # Treat as success in terms of desired state
         else:
-            print(f"[WARN] Unload request for model '{model_name}' failed with status {resp.status_code}: {resp.text[:150]}")
+            print(f"[WARN] Ollama unload request for model '{model_name}' failed with status {resp.status_code}: {resp.text[:150]}")
             return False
     except requests.exceptions.Timeout:
-        print(f"[WARN] Unload request for model '{model_name}' timed out after {unload_timeout}s.")
+        print(f"[WARN] Ollama unload request for model '{model_name}' timed out after {unload_timeout}s.")
         return False
     except requests.exceptions.RequestException as e:
-        print(f"[WARN] Unload request failed for model '{model_name}': {e}")
+        print(f"[WARN] Ollama unload request failed for model '{model_name}': {e}")
         return False
     except Exception as e:
-        print(f"[WARN] Unexpected error during unload request for '{model_name}': {e}")
+        print(f"[WARN] Unexpected error during Ollama unload request for '{model_name}': {e}")
         return False
 
 
 # --- Fallback for PID detection (less reliable than psutil) ---
+# This remains specific to Ollama's error message format
 def _get_ollama_pid_via_api(runtime_config):
     """Tries to get Ollama PID via a failed API call (fallback)."""
-    # (Implementation remains the same as previous version)
     url = _get_ollama_url(runtime_config, OLLAMA_SHOW_PATH)
     try:
         dummy_model = "nonexistent_model_for_pid_check:latest"

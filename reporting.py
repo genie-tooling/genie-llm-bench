@@ -21,19 +21,12 @@ STAGE_COLORS = {"None": "skyblue", "Gates": "lightcoral", "Persona": "lightgreen
 
 def get_model_stage(model_name):
     """Extracts the stage (None, Gates, Persona) from the model name."""
-    # Simple check based on keywords in the model name string
-    if "Gates" in model_name:
-        return "Gates"
-    elif "Persona" in model_name:
-        return "Persona"
-    else:
-        return "None"
+    if "Gates" in model_name: return "Gates"
+    elif "Persona" in model_name: return "Persona"
+    else: return "None"
 
 def generate_ranking_plot(results, metric_key, title, ylabel, output_filename, runtime_config, lower_is_better=False, value_format="{:.1f}", is_percentage=False, group_by_stage=False):
     """Generates a horizontal bar chart ranking models by a metric."""
-    # Args: ... (same as before) ... group_by_stage (bool): Color-code bars by stage (None, Gates, Persona).
-    # Returns: str | None: Relative path to the saved image ("images/filename.png") or None on failure/skip.
-
     if not runtime_config.visualizations_enabled or not runtime_config.matplotlib_available:
         return None
 
@@ -44,18 +37,22 @@ def generate_ranking_plot(results, metric_key, title, ylabel, output_filename, r
     for model, data in results.items():
         if model.startswith("_"): continue
         summary = data.get("_summary")
+        # MODIFIED FOR VLLM: Ensure summary exists and model completed
         if summary and summary.get("status") == "Completed":
             value = summary.get(metric_key)
+            # MODIFIED FOR VLLM: Skip if metric is None (e.g., tokps for vLLM) unless explicitly plotting None values
             if value is not None and value == value: # Check for valid number (not None or NaN)
                 try:
                     model_name = summary.get("model_name", model)
                     stage = get_model_stage(model_name) # Always determine stage if grouping is enabled
                     plot_data.append((model_name, float(value), stage))
                 except (ValueError, TypeError):
-                    print(f"[WARN] Skipping model '{model}' for plot '{title}': Metric '{metric_key}' value '{value}' is not numeric.")
+                    # print(f"[WARN] Skipping model '{model}' for plot '{title}': Metric '{metric_key}' value '{value}' is not numeric.")
                     continue
+            # else: print(f"[DEBUG] Skipping model '{model}' for plot '{title}': Metric '{metric_key}' is None.")
 
     if not plot_data:
+        print(f"[INFO] No valid data found for metric '{metric_key}' to generate plot '{title}'.")
         return None
 
     # Sort data primarily by metric value
@@ -77,7 +74,11 @@ def generate_ranking_plot(results, metric_key, title, ylabel, output_filename, r
 
         ax.set_xlabel(ylabel)
         ax.set_ylabel("Model")
-        ax.set_title(title, fontsize=14, fontweight='bold')
+        # MODIFIED FOR VLLM: Add provider scope clarification to titles if needed
+        plot_title = title
+        if metric_key == "tokens_per_sec_avg": plot_title += " (Ollama Only)"
+        if metric_key == "ollama_perf_score": plot_title += " (Ollama Only)"
+        ax.set_title(plot_title, fontsize=14, fontweight='bold')
         ax.invert_yaxis() # Display highest rank at the top
 
         # Add value labels to bars
@@ -89,13 +90,12 @@ def generate_ranking_plot(results, metric_key, title, ylabel, output_filename, r
             min_val = min(values)
             padding = (max_val - min_val) * 0.15 if max_val != min_val else abs(max_val) * 0.15 + 1
             if lower_is_better:
-                # Ensure min_val is calculated correctly when lower is better
                 min_val_for_limit = min(v for _, v, _ in plot_data)
                 max_val_for_limit = max(v for _, v, _ in plot_data)
                 padding = (max_val_for_limit - min_val_for_limit) * 0.15 if max_val_for_limit != min_val_for_limit else abs(max_val_for_limit) * 0.15 + 1
-                ax.set_xlim(left=min_val_for_limit - padding, right=max_val_for_limit + padding * 0.1)
+                ax.set_xlim(left=max(0, min_val_for_limit - padding), right=max_val_for_limit + padding * 0.1) # Ensure left limit >= 0
             else:
-                ax.set_xlim(left=min_val - padding * 0.1, right=max_val + padding)
+                ax.set_xlim(left=max(0, min_val - padding * 0.1), right=max_val + padding) # Ensure left limit >= 0
 
         # Add legend if grouping by stage
         if group_by_stage:
@@ -126,9 +126,6 @@ def generate_ranking_plot(results, metric_key, title, ylabel, output_filename, r
 
 def generate_html_report(results, benchmark_name, plot_paths, runtime_config):
     """Generates the full HTML report content from benchmark results."""
-    # Args: results (dict): Benchmark data. benchmark_name (str): Title for the report. plot_paths (dict): Paths to generated plots. runtime_config (RuntimeConfig): Config object.
-    # Returns: str | None: The generated HTML content as a string, or None on failure.
-
     template_file = runtime_config.html_template_file
     if not template_file.is_file():
         print(f"[ERROR] HTML template '{template_file}' not found.")
@@ -143,27 +140,38 @@ def generate_html_report(results, benchmark_name, plot_paths, runtime_config):
 
     # --- Prepare Data for Template ---
 
-    # 1. Summary Table Rows (Sort by Overall Score, then Ollama Score)
+    # 1. Summary Table Rows (Sort by Overall Score, then Ollama Score for Ollama models)
     summary_rows_html = []
     valid_models = [m for m, d in results.items() if not m.startswith("_") and isinstance(d, dict) and d.get("_summary", {}).get("status") == "Completed"]
 
-    # Sort models: Higher Overall Score is better, higher Ollama Score is better tie-breaker
+    # Sort models: Higher Overall Score is better.
+    # Tie-breaker: Higher Ollama Score is better (only affects Ollama models).
     sorted_models = sorted(valid_models,
                            key=lambda m: (results[m]["_summary"].get("overall_weighted_score", -1),
-                                          results[m]["_summary"].get("ollama_perf_score", -1)),
+                                          results[m]["_summary"].get("ollama_perf_score", -1) if results[m]["_summary"].get("provider") == "ollama" else -1),
                            reverse=True)
 
     for rank, model_name in enumerate(sorted_models, 1):
         summary = results[model_name]["_summary"]
+        provider = summary.get('provider', 'N/A') # MODIFIED FOR VLLM
+
+        # MODIFIED FOR VLLM: Handle N/A for Ollama-specific metrics
+        ollama_perf_score_str = format_na(summary.get('ollama_perf_score'), precision=1) if provider == 'ollama' else "N/A"
+        avg_tokps_str = format_na(summary.get('tokens_per_sec_avg'), precision=1) if provider == 'ollama' else "N/A"
+        # RAM/GPU are for local providers
+        ram_delta_str = format_na(summary.get('delta_ram_mb'), suffix=' MB', precision=1) if provider in ['ollama', 'vllm'] else "N/A"
+        gpu_delta_str = format_na(summary.get('delta_gpu_mem_mb'), suffix=' MB', precision=1) if provider in ['ollama', 'vllm'] else "N/A"
+
         row = f"""<tr>
             <td>{rank}</td>
             <td>{summary.get('model_name', model_name)}</td>
+            <td>{provider.upper()}</td>
             <td>{format_na(summary.get('overall_weighted_score'), precision=1)}</td>
-            <td>{format_na(summary.get('ollama_perf_score'), precision=1)}</td>
+            <td>{ollama_perf_score_str}</td>
             <td>{format_na(summary.get('accuracy'), suffix='%', precision=1)}</td>
-            <td>{format_na(summary.get('tokens_per_sec_avg'), precision=1)}</td>
-            <td>{format_na(summary.get('delta_ram_mb'), suffix=' MB', precision=1)}</td>
-            <td>{format_na(summary.get('delta_gpu_mem_mb'), suffix=' MB', precision=1)}</td>
+            <td>{avg_tokps_str}</td>
+            <td>{ram_delta_str}</td>
+            <td>{gpu_delta_str}</td>
             <td>{format_na(summary.get('partial_score_avg'), suffix='%', precision=1)}</td>
             <td>{format_na(summary.get('avg_time_per_task'), suffix='s', precision=2)}</td>
             <td>{format_na(summary.get('error_rate'), suffix='%', precision=1)}</td>
@@ -174,9 +182,11 @@ def generate_html_report(results, benchmark_name, plot_paths, runtime_config):
     skipped_models = [m for m in results if not m.startswith("_") and isinstance(results[m], dict) and m not in valid_models]
     for model_name in skipped_models:
          summary = results[model_name].get("_summary", {"status": "Unknown"})
+         provider = summary.get('provider', get_provider_from_model_name(model_name)) # Guess provider if missing
          row = f"""<tr>
              <td>-</td>
              <td>{summary.get('model_name', model_name)}</td>
+             <td>{provider.upper()}</td>
              <td colspan="9" style="text-align:center; font-style:italic;">{summary.get('status')}</td>
          </tr>"""
          summary_rows_html.append(row)
@@ -191,7 +201,7 @@ def generate_html_report(results, benchmark_name, plot_paths, runtime_config):
 
     for model in valid_models: # Only aggregate from completed models
         summary = results[model]["_summary"]
-        has_ollama_metrics = summary.get("provider") == "ollama" # Only count tok/s for ollama
+        provider = summary.get("provider") # MODIFIED FOR VLLM
 
         for ttype, stats in summary.get("per_type", {}).items():
              agg = per_type_summary[ttype]
@@ -203,24 +213,21 @@ def generate_html_report(results, benchmark_name, plot_paths, runtime_config):
              agg['success_api_calls_total'] += stats.get('success_api_calls', 0)
 
              if stats.get('avg_score') is not None and stats.get('score_count', 0) > 0:
-                 # Ensure avg_score is float before multiplying
                  try:
                      avg_score_val = float(stats['avg_score'])
                      score_count_val = int(stats['score_count'])
                      agg['score_sum_total'] += avg_score_val * score_count_val
                      agg['scored_tasks_total'] += score_count_val
-                 except (ValueError, TypeError):
-                     print(f"[WARN] Invalid score data for {model}/{ttype}: avg_score={stats.get('avg_score')}, score_count={stats.get('score_count')}")
+                 except (ValueError, TypeError): pass # Ignore invalid data
 
-             if has_ollama_metrics and stats.get('avg_tokps') is not None and stats.get('tokps_count', 0) > 0:
-                 # Ensure avg_tokps is float before multiplying
+             # MODIFIED FOR VLLM: Only aggregate Tok/s for Ollama
+             if provider == "ollama" and stats.get('avg_tokps') is not None and stats.get('tokps_count', 0) > 0:
                  try:
                      avg_tokps_val = float(stats['avg_tokps'])
                      tokps_count_val = int(stats['tokps_count'])
                      agg['tokps_sum_total'] += avg_tokps_val * tokps_count_val
                      agg['tokps_tasks_total'] += tokps_count_val
-                 except (ValueError, TypeError):
-                     print(f"[WARN] Invalid tokps data for {model}/{ttype}: avg_tokps={stats.get('avg_tokps')}, tokps_count={stats.get('tokps_count')}")
+                 except (ValueError, TypeError): pass # Ignore invalid data
 
 
     per_type_rows_html = []
@@ -232,6 +239,7 @@ def generate_html_report(results, benchmark_name, plot_paths, runtime_config):
         avg_acc = (agg['correct_total'] / agg['success_api_calls_total']) * 100 if agg['success_api_calls_total'] > 0 else 0.0
         avg_score = agg['score_sum_total'] / agg['scored_tasks_total'] if agg['scored_tasks_total'] > 0 else None
         avg_time = agg['time_total'] / agg['task_count_total']
+        # MODIFIED FOR VLLM: Only calculate avg_tokps if there were Ollama tasks counted
         avg_tokps = agg['tokps_sum_total'] / agg['tokps_tasks_total'] if agg['tokps_tasks_total'] > 0 else None
 
         row = f"""<tr>
@@ -260,7 +268,7 @@ def generate_html_report(results, benchmark_name, plot_paths, runtime_config):
         provider = summary.get("provider", "N/A")
 
         # Start collapsible block
-        model_block = f'\n<button type="button" class="collapsible">Model: {model_name} ({provider}) - Status: {status}</button>\n'
+        model_block = f'\n<button type="button" class="collapsible">Model: {model_name} ({provider.upper()}) - Status: {status}</button>\n'
         model_block += '<div class="content">\n'
 
         if status != "Completed":
@@ -269,11 +277,15 @@ def generate_html_report(results, benchmark_name, plot_paths, runtime_config):
             # Add mini-summary table at the top of the details
             model_block += "<h4>Model Quick Stats:</h4>\n<table class='mini-summary'><tbody>\n"
             model_block += f"<tr><th>Overall Score</th><td>{format_na(summary.get('overall_weighted_score'), '', 1)}</td></tr>\n"
-            if provider == "ollama": # Show Ollama score only for Ollama models
+            # MODIFIED FOR VLLM: Only show Ollama score for Ollama
+            if provider == "ollama":
                  model_block += f"<tr><th>Ollama Score</th><td>{format_na(summary.get('ollama_perf_score'), '', 1)}</td></tr>\n"
             model_block += f"<tr><th>Accuracy</th><td>{format_na(summary.get('accuracy'), '%', 1)}</td></tr>\n"
+            # MODIFIED FOR VLLM: Only show Tok/s for Ollama
             if provider == "ollama":
                 model_block += f"<tr><th>Avg Tok/s</th><td>{format_na(summary.get('tokens_per_sec_avg'), '', 1)}</td></tr>\n"
+            # MODIFIED FOR VLLM: Show RAM/GPU for local providers
+            if provider in ['ollama', 'vllm']:
                 if summary.get("delta_ram_mb") is not None: model_block += f"<tr><th>RAM Delta</th><td>{format_na(summary.get('delta_ram_mb'), ' MB', 1)}</td></tr>\n"
                 if summary.get("delta_gpu_mem_mb") is not None: model_block += f"<tr><th>GPU Mem Delta</th><td>{format_na(summary.get('delta_gpu_mem_mb'), ' MB', 1)}</td></tr>\n"
             model_block += f"<tr><th>Avg Time/Task</th><td>{format_na(summary.get('avg_time_per_task'), 's', 2)}</td></tr>\n"
@@ -284,66 +296,49 @@ def generate_html_report(results, benchmark_name, plot_paths, runtime_config):
             model_block += "<h4 style='clear: both;'>Task Breakdown:</h4>\n" # Clear float
             model_block += "<table class='detailed-tasks'>\n<thead><tr><th>Task Name</th><th>Type</th><th>Prompt Snippet</th><th>Status</th><th>Metric</th><th>Details / Response Snippet</th><th>Duration (s)</th><th>Tok/s</th></tr></thead>\n<tbody>\n"
 
-            # Ensure tasks are ordered consistently if possible (using task_definitions order)
             task_names_in_model = [tname for tname in model_data if not tname.startswith("_")]
             ordered_task_names = [tname for tname in task_definitions if tname in task_names_in_model]
-            # Add any tasks run but not in current definitions (e.g., from cache)
             ordered_task_names += [tname for tname in task_names_in_model if tname not in ordered_task_names]
 
             for task_name in ordered_task_names:
                 task_result = model_data[task_name]
-                task_def = task_definitions.get(task_name, {}) # Get definition if available
+                task_def = task_definitions.get(task_name, {})
 
                 prompt_snippet = truncate_text(task_def.get("prompt", "N/A"), 100)
                 response_snippet = truncate_text(task_result.get("response", ""), 150)
                 details = task_result.get("details", "N/A")
                 metric = task_result.get("metric")
-                ttype = task_result.get("task_type", task_def.get("type", "N/A")) # Use result's type first
+                ttype = task_result.get("task_type", task_def.get("type", "N/A"))
                 error = task_result.get("error")
+                # MODIFIED FOR VLLM: Tok/s only for Ollama
+                tokps_str = format_na(task_result.get('tokens_per_sec'), precision=1) if provider == 'ollama' else "N/A"
 
-                status_str = "N/A"
-                metric_str = ""
-                status_class = "status-unknown" # CSS class
-
+                status_str = "N/A"; metric_str = ""; status_class = "status-unknown"
                 if error:
-                    status_str = "API Error"
-                    metric_str = "N/A"
-                    details = error # Show full API error message here
-                    response_snippet = "N/A"
-                    status_class = "status-error"
+                    status_str = "API Error"; metric_str = "N/A"; details = error
+                    response_snippet = "N/A"; status_class = "status-error"
                 elif isinstance(metric, bool):
-                    status_str = "PASS" if metric else "FAIL"
-                    metric_str = str(metric)
+                    status_str = "PASS" if metric else "FAIL"; metric_str = str(metric)
                     status_class = "status-pass" if metric else "status-fail"
                 elif isinstance(metric, (float, int)):
-                    score = float(metric)
-                    pass_threshold = runtime_config.passing_score_threshold
-                    is_pass = (score >= pass_threshold)
-                    status_str = "PASS" if is_pass else "FAIL"
-                    metric_str = f"{score:.1f}%"
-                    status_class = "status-pass" if is_pass else "status-fail"
-                else: # Unknown metric type or None metric without error
+                    score = float(metric); pass_threshold = runtime_config.passing_score_threshold
+                    is_pass = (score >= pass_threshold); status_str = "PASS" if is_pass else "FAIL"
+                    metric_str = f"{score:.1f}%"; status_class = "status-pass" if is_pass else "status-fail"
+                else:
                     status_str = "Unknown" if metric is None else "Invalid Metric"
-                    metric_str = str(metric) if metric is not None else "N/A"
-                    status_class = "status-unknown"
+                    metric_str = str(metric) if metric is not None else "N/A"; status_class = "status-unknown"
 
-                # Combine details and response snippet for display
                 combined_details = f"<i>Details:</i> {details}" if details and details != "N/A" else ""
-                if response_snippet and response_snippet != "N/A":
-                     combined_details += f"<br><i>Resp:</i> <pre class='response-snippet'>{response_snippet}</pre>"
-                elif error:
-                     combined_details = f"<i>Error:</i> <pre class='response-snippet'>{details}</pre>"
-
+                if response_snippet and response_snippet != "N/A": combined_details += f"<br><i>Resp:</i> <pre class='response-snippet'>{response_snippet}</pre>"
+                elif error: combined_details = f"<i>Error:</i> <pre class='response-snippet'>{details}</pre>"
 
                 row = f"""<tr>
-                    <td>{task_name}</td>
-                    <td>{ttype}</td>
+                    <td>{task_name}</td><td>{ttype}</td>
                     <td><pre class='prompt-snippet'>{prompt_snippet}</pre></td>
-                    <td class='{status_class}'>{status_str}</td>
-                    <td>{metric_str}</td>
+                    <td class='{status_class}'>{status_str}</td><td>{metric_str}</td>
                     <td class='details-cell'>{combined_details}</td>
                     <td>{format_na(task_result.get('duration'), precision=2)}</td>
-                    <td>{format_na(task_result.get('tokens_per_sec'), precision=1)}</td>
+                    <td>{tokps_str}</td>
                 </tr>"""
                 model_block += row
 
@@ -353,7 +348,6 @@ def generate_html_report(results, benchmark_name, plot_paths, runtime_config):
 
 
     # 4. Full JSON Data
-    # Exclude helper keys added during run/reporting
     results_for_json = {k: v for k, v in results.items() if k not in ["_task_definitions", "_task_categories", "_category_weights_used", "_ollama_score_weights_used"]}
     try:
         full_json = json.dumps(results_for_json, indent=2, default=str)
@@ -367,16 +361,15 @@ def generate_html_report(results, benchmark_name, plot_paths, runtime_config):
     final_html = final_html.replace("{{REPORT_TITLE}}", benchmark_name)
     final_html = final_html.replace("{{TIMESTAMP}}", datetime.now().strftime("%Y-%m-%d %H:%M:%S %Z"))
 
-    # Inject plot paths (use placeholders if path is None or generation failed)
-    placeholder_img_rel_path = "images/placeholder.png" # Assume a placeholder exists
+    # Inject plot paths
     plot_html_content = ""
     plot_keys = [
         ("Overall Score", "overall_score", "Overall Weighted Score Ranking (Higher is Better)"),
-        ("Ollama Performance Score", "ollama_score", "Ollama Performance Score Ranking (Higher is Better)"),
+        ("Ollama Performance Score", "ollama_score", "Ollama Performance Score Ranking (Ollama Only, Higher is Better)"),
         ("Accuracy", "accuracy", "Overall Accuracy (%) Ranking (Higher is Better)"),
-        ("Tokens/Second (Ollama)", "tokps", "Average Tokens/Second Ranking (Ollama Models, Higher is Better)"),
-        ("RAM Delta (Ollama)", "ram", "Peak RAM Increase Ranking (Ollama Models, Lower is Better)"),
-        ("GPU Memory Delta (Ollama)", "gpu", "Peak GPU Memory Increase Ranking (Ollama Models - GPU 0, Lower is Better)"),
+        ("Tokens/Second (Ollama)", "tokps", "Average Tokens/Second Ranking (Ollama Only, Higher is Better)"),
+        ("RAM Delta (Local)", "ram", "Peak RAM Increase Ranking (Ollama/vLLM, Lower is Better)"),
+        ("GPU Memory Delta (Local)", "gpu", "Peak GPU Memory Increase Ranking (Ollama/vLLM - GPU 0, Lower is Better)"),
         ("Accuracy by Stage", "accuracy_by_stage", "Accuracy by Stage (None, Gates, Persona)"),
         ("Overall Score by Stage", "overall_score_by_stage", "Overall Score by Stage (None, Gates, Persona)"),
     ]
@@ -385,17 +378,12 @@ def generate_html_report(results, benchmark_name, plot_paths, runtime_config):
         img_path = plot_paths.get(plot_key)
         if img_path and pathlib.Path(runtime_config.report_dir / img_path).is_file():
             plot_html_content += f'<img src="{img_path}" alt="{plot_title} Plot" title="{plot_tooltip}">\n'
-            if plot_key != plot_keys[-1][1]: # Don't add separator after the last plot
-                 plot_html_content += '<hr class="plot-separator">\n'
+            if plot_key != plot_keys[-1][1]: plot_html_content += '<hr class="plot-separator">\n'
         elif runtime_config.visualizations_enabled and runtime_config.matplotlib_available:
-            # Plot was expected but failed or data was missing
-            print(f"[WARN] Plot '{plot_title}' path not found or file missing, skipping in report.")
-            # Optionally add a placeholder text in the report here
-            # plot_html_content += f'<p style="font-style: italic; color: grey;">Plot for {plot_title} could not be generated.</p><hr class="plot-separator">\n'
+            # Only warn/skip if plots were expected
+             print(f"[WARN] Plot '{plot_title}' path not found or file missing, skipping in report.")
 
-
-    # Replace the placeholder comment with the generated plot images
-    final_html = final_html.replace("<!-- Plots injected here -->", plot_html_content if plot_html_content else "<p>No plots were generated.</p>")
+    final_html = final_html.replace("<!-- Plots injected here -->", plot_html_content if plot_html_content else "<p>No plots were generated or data was insufficient.</p>")
 
     # Inject table rows and detail blocks
     final_html = final_html.replace("{{SUMMARY_TABLE_ROWS}}", "\n".join(summary_rows_html))
@@ -406,9 +394,7 @@ def generate_html_report(results, benchmark_name, plot_paths, runtime_config):
     # Add warning if plots were expected but library was missing
     if runtime_config.visualizations_enabled and not runtime_config.matplotlib_available:
          warning_msg = '<p style="color:red; text-align:center; font-style:italic;">Note: Matplotlib library not found, plots could not be generated. Install with: pip install matplotlib</p>'
-         # Inject warning before the plot container
          final_html = re.sub(r'(<div class="plot-container">)', warning_msg + r'\1', final_html, count=1)
-
 
     return final_html
 
@@ -417,11 +403,8 @@ def generate_html_report(results, benchmark_name, plot_paths, runtime_config):
 
 def save_report(html_content, runtime_config):
     """Saves the generated HTML report to the configured file path."""
-    # Args: html_content (str): The HTML string. runtime_config (RuntimeConfig): Config object with paths.
-    # Returns: pathlib.Path | None: The path where the report was saved, or None on failure.
     report_file = runtime_config.report_html_file
     try:
-        # Ensure parent directory exists
         report_file.parent.mkdir(parents=True, exist_ok=True)
         with open(report_file, "w", encoding="utf-8") as f:
             f.write(html_content)
@@ -433,8 +416,6 @@ def save_report(html_content, runtime_config):
 
 def open_report_auto(report_path):
     """Attempts to open the saved report in the default web browser."""
-    # Args: report_path (pathlib.Path): Path to the HTML report file.
-    # Returns: None
     if not report_path: return
     try:
         report_uri = report_path.resolve().as_uri()
@@ -442,3 +423,11 @@ def open_report_auto(report_path):
         webbrowser.open(report_uri)
     except Exception as e:
         print(f"[WARN] Could not auto-open report: {e}\n      Report is at: {report_path.resolve()}")
+
+# --- Helper for Provider Identification (used locally) ---
+def get_provider_from_model_name(model_name):
+    """Determines the provider based on model name convention."""
+    if model_name.startswith("vllm/"): return "vllm"
+    elif model_name.startswith("gemini-") or model_name.startswith("models/"): return "gemini"
+    elif model_name.startswith("ollama/"): return "ollama"
+    else: return "ollama" # Default assumption

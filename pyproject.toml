@@ -1,0 +1,83 @@
+# pyproject.toml
+
+[build-system]
+# Specifies the build backend (standard for setuptools)
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+# Core project metadata
+name = "llm-bench"
+version = "0.8.0" # Increment as features are added (e.g., vLLM support)
+description = "A command-line tool to benchmark local (Ollama, vLLM) and remote (Google Gemini) LLMs."
+readme = "README.md"
+license = "MIT"
+authors = [
+    { name = "Your Name / Organization", email = "your_email@example.com" },
+    # Add other contributors if desired
+]
+requires-python = "<=3.13" # Specify minimum Python version
+
+# Core runtime dependencies needed for basic operation
+dependencies = [
+    "requests>=2.20.0", # For API calls (Ollama, Gemini)
+    "PyYAML>=5.0",      # For config.yaml loading and YAML tasks
+    "openai>=1.0.0",    # For vLLM OpenAI-compatible API calls
+]
+
+# Optional dependencies for specific features
+# Install using: pip install .[feature_name]
+# Example: pip install .[plots,gpu]
+[project.optional-dependencies]
+ram = [
+    "psutil>=5.0.0", # For CPU RAM Monitoring (--ram-monitor enable)
+]
+gpu = [
+    "pynvml>=11.0.0", # For NVIDIA GPU Monitoring (--gpu-monitor enable)
+]
+plots = [
+    "matplotlib>=3.0.0", # For Report Visualizations (--visualizations enable)
+]
+semantic = [
+    "sentence-transformers>=2.0.0", # For Semantic Similarity Evaluation (--semantic-eval enable)
+]
+# Group to install all optional runtime features
+all = [
+    "llm-bench[ram]",
+    "llm-bench[gpu]",
+    "llm-bench[plots]",
+    "llm-bench[semantic]",
+]
+# Group for development dependencies (includes all optional features + testing tools)
+dev = [
+    "llm-bench[all]",
+    "pytest>=7.0.0", # Example testing framework
+    # Add other dev tools like linters (ruff, black), type checkers (mypy) if desired
+    # "ruff",
+    # "black",
+    # "mypy",
+]
+
+[project.scripts]
+# Defines an entry point if the package is installed
+# Allows running 'llmbench --help' after 'pip install .'
+llmbench = "benchmark_cli:main"
+
+# --- Tool Configurations (Optional) ---
+
+# Example: Configuration for Ruff (Linter/Formatter)
+[tool.ruff]
+line-length = 150
+# target-version = "py39" # Match requires-python
+
+# [tool.ruff.lint]
+# select = ["E", "F", "W", "I"] # Example rule sets (Error, Pyflakes, Warning, Isort)
+# ignore = []
+
+# Example: Configuration for Pytest
+# [tool.pytest.ini_options]
+# minversion = "7.0"
+# addopts = "-ra -q" # Example options
+# testpaths = [
+#     "tests",
+# ]

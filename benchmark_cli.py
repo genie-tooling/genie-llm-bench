@@ -17,7 +17,7 @@ from collections import defaultdict
 import config # Base config and loading function
 from config import RuntimeConfig, load_config_from_file # Import the class and loader
 from utils import format_na # Import utils early if needed for printing
-from llm_clients import pull_ollama_model, get_local_ollama_models # Needed for pre-checks
+from llm_clients import pull_ollama_model, get_local_ollama_models, get_provider_from_model_name # MODIFIED FOR VLLM
 from benchmark_runner import run_benchmark_set
 from scoring import compute_performance_scores
 from reporting import generate_ranking_plot, generate_html_report, save_report, open_report_auto
@@ -27,7 +27,6 @@ from export import export_summary_csv, export_details_json # Added for export
 import system_monitor
 
 # --- Dependency Check Function ---
-# (check_dependencies function remains the same as before)
 def check_dependencies(check_runtime_config):
     """Checks for optional dependencies and reports their status."""
     print("\n--- Dependency Check ---")
@@ -35,6 +34,16 @@ def check_dependencies(check_runtime_config):
     print(f"Platform: {platform.system()} ({platform.release()})")
     all_ok = True
     lib_status = {}
+
+    # Check OpenAI (Required for vLLM) - VLLM ADDITION
+    try:
+        import openai
+        print("[ OK ] OpenAI: Found (Required for vLLM provider)")
+        lib_status['openai'] = True
+    except ImportError:
+        print("[WARN] OpenAI: Not Found (Required for vLLM provider. Install: pip install openai)")
+        lib_status['openai'] = False
+        # Don't mark all_ok as False, as vLLM might not be used
 
     # Check PyYAML (Required for config, needed for YAML tasks)
     try:
@@ -50,11 +59,13 @@ def check_dependencies(check_runtime_config):
     try:
         import psutil
         print("[ OK ] psutil: Found")
-        # Test getting PIDs (might fail due to permissions, but confirms import)
         try:
+            # Check PIDs for local providers (Ollama + vLLM)
             # Pass the runtime_config needed for API fallback in get_ollama_pids
-            pids = system_monitor.get_ollama_pids(psutil, check_runtime_config)
-            print(f"       - psutil check: Found {len(pids)} potential Ollama PIDs (permissions permitting)")
+            ollama_pids = system_monitor.get_ollama_pids(psutil, check_runtime_config)
+            vllm_pids = system_monitor.get_vllm_pids(psutil, check_runtime_config)
+            combined_pids = list(set(ollama_pids + vllm_pids))
+            print(f"       - psutil check: Found {len(combined_pids)} potential Ollama/vLLM PIDs (permissions permitting)")
             lib_status['psutil'] = True
         except Exception as e:
             print(f"       - psutil check: Error during PID check (permissions?): {e}")
@@ -83,8 +94,6 @@ def check_dependencies(check_runtime_config):
         except pynvml.NVMLError as e:
             print(f"       - NVML Initialization Error: {e}. GPU Monitoring disabled.")
             lib_status['pynvml'] = 'NVML Error'
-            # Treat NVML error as critical only if GPU monitoring is explicitly enabled in config?
-            # For check, just report it.
         except Exception as e:
             print(f"       - Unexpected PyNVML Error: {e}")
             lib_status['pynvml'] = 'Error'
@@ -106,7 +115,6 @@ def check_dependencies(check_runtime_config):
         print(f"[WARN] Matplotlib: Error during import/backend setting: {e}. Visualizations may fail.")
         lib_status['matplotlib'] = 'Error'
 
-
     # Check Sentence Transformers (Semantic Eval)
     try:
         from sentence_transformers import SentenceTransformer
@@ -114,7 +122,6 @@ def check_dependencies(check_runtime_config):
         model_name = 'all-MiniLM-L6-v2' # Standard model for check
         print(f"       - Attempting to load semantic model '{model_name}'...")
         try:
-            # Use a minimal load check
             semantic_model = SentenceTransformer(model_name)
             _ = semantic_model.encode("test sentence")
             print(f"       - Semantic model loaded and test encode successful: OK")
@@ -123,15 +130,13 @@ def check_dependencies(check_runtime_config):
         except Exception as e:
             print(f"       - Semantic model load/test FAILED: {e}. Semantic evaluation disabled if enabled.")
             lib_status['sentence-transformers'] = 'Model Error'
-            # Treat model error as critical only if semantic eval is enabled?
-            # For check, just report it.
     except ImportError:
         print("[WARN] sentence-transformers: Not Found (Required for --semantic-eval enable. Install: pip install sentence-transformers)")
         lib_status['sentence-transformers'] = False
 
     print("\n--- Summary ---")
     if all_ok and all(v not in ['Error', 'NVML Error', 'Model Error'] for v in lib_status.values()):
-        print("Core dependencies (requests, PyYAML) present.")
+        print("Core dependencies (requests, PyYAML, OpenAI) present or warnings noted.")
         print("All checked optional features seem ready based on installed libraries and basic checks.")
         print("Note: Runtime errors (e.g., permissions, specific hardware issues) can still occur.")
         return True
@@ -157,26 +162,18 @@ def setup_runtime_config(args, loaded_file_config):
 
     # --- Model Selection Logic ---
     if args.test_model:
-        # --test-model overrides default_models from config
         cfg.models_to_benchmark = sorted(list(set(args.test_model)))
         if args.code_model:
-            # If --code-model is ALSO provided, use it specifically for code tasks
             cfg.code_models_to_benchmark = sorted(list(set(args.code_model)))
         else:
-            # If ONLY --test-model is provided, it applies to ALL tasks, overriding config code_models
             cfg.code_models_to_benchmark = list(cfg.models_to_benchmark)
             print("[INFO] --test-model provided without --code-model. Applying specified models to all task types.")
     else:
-        # No --test-model provided, use defaults from config (already loaded)
-        # If --code-model is provided, it overrides config code_models
         if args.code_model:
             cfg.code_models_to_benchmark = sorted(list(set(args.code_model)))
         else:
-            # No --code-model provided either, use config code_models (already loaded)
-            # If config also didn't have code_models, default code list to general list
             if not cfg.code_models_to_benchmark:
                  cfg.code_models_to_benchmark = list(cfg.models_to_benchmark)
-
 
     # --- Other CLI Overrides ---
     # Paths override
@@ -184,6 +181,9 @@ def setup_runtime_config(args, loaded_file_config):
     if args.report_dir: cfg.report_dir = args.report_dir
     if args.cache_dir: cfg.cache_dir = args.cache_dir
     if args.template_file: cfg.html_template_file = args.template_file
+
+    # VLLM Host override - VLLM ADDITION
+    if args.vllm_host: cfg.vllm_host_url = args.vllm_host
 
     # Recalculate derived paths after potential overrides
     cfg.report_img_dir = cfg.report_dir / "images"
@@ -211,7 +211,6 @@ def setup_runtime_config(args, loaded_file_config):
             cfg.default_category_weight = cli_weights.get('default', cfg.default_category_weight)
         except (json.JSONDecodeError, ValueError):
              print(f"[WARN] Invalid JSON in --category-weights argument. Using weights from config file or defaults.")
-    # cfg.category_weights holds value from ENV/file if CLI is invalid/not provided
 
     # Feature toggles: CLI 'enable'/'disable' overrides file/ENV config
     if args.ram_monitor is not None: cfg.ram_monitor_enabled = (args.ram_monitor == "enable")
@@ -221,7 +220,16 @@ def setup_runtime_config(args, loaded_file_config):
 
     # --- 4. Perform Conditional Imports based on FINALIZED config ---
     print("\n--- Initializing Optional Dependencies Based on Config ---")
-    # (Conditional import logic remains the same...)
+   
+    try:
+        import openai
+        cfg.openai = openai
+        cfg.openai_available = True
+        print("[INFO] OpenAI library imported successfully (for vLLM).")
+    except ImportError:
+        print("[WARN] OpenAI library not found. vLLM provider will be unavailable. Run: pip install openai")
+        cfg.openai_available = False
+
     if cfg.ram_monitor_enabled:
         try:
             import psutil
@@ -317,7 +325,6 @@ def setup_runtime_config(args, loaded_file_config):
 
 
 # --- Function to Load and Validate Tasks ---
-# (load_and_validate_tasks function remains the same as before)
 def load_and_validate_tasks(tasks_file, runtime_config):
     """Loads tasks from JSON file, validates structure, and filters based on dependencies."""
     loaded_tasks_dict = {} # name -> task_def map
@@ -388,16 +395,18 @@ def load_and_validate_tasks(tasks_file, runtime_config):
 # --- Main Function ---
 def main():
     # --- Argument Parsing ---
-    # (Argument parser setup remains the same...)
     parser = argparse.ArgumentParser(
-        description="LLM Benchmark Runner - Evaluate local and remote LLMs.",
+        description="LLM Benchmark Runner - Evaluate local (Ollama, vLLM) and remote (Gemini) LLMs.", # MODIFIED FOR VLLM
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--config-file", default=config.DEFAULT_CONFIG_FILE, type=pathlib.Path, help="Path to the YAML configuration file.")
-    parser.add_argument("--test-model", action="append", help="Specify a model name to benchmark. Use multiple times. Overrides config file defaults for ALL tasks unless --code-model is also used.")
+    parser.add_argument("--test-model", action="append", help="Specify model name (e.g., 'ollama/llama3:8b', 'vllm/model-id', 'gemini-x'). Use prefix or rely on config. Use multiple times. Overrides config file defaults for ALL tasks unless --code-model is also used.")
     parser.add_argument("--code-model", action="append", help="Specify model name ONLY for code tasks. Overrides config file 'code_models'. Use multiple times.")
     parser.add_argument("--task-set", choices=["all", "nlp", "code", "other"], default="all", help="Which category of tasks to run (uses category keys in tasks file).")
     parser.add_argument("--task-name", action="append", help="Run ONLY specific tasks by name. Use multiple times. Overrides --task-set.")
     parser.add_argument("--gemini-key", default=None, help="API key for Google Gemini. Overrides ENV var and config file.")
+    # --- VLLM ADDITION START ---
+    parser.add_argument("--vllm-host", default=None, help="URL for vLLM OpenAI-compatible API endpoint (e.g., http://localhost:8000/v1). Overrides config file and VLLM_HOST env var.")
+    # --- VLLM ADDITION END ---
     parser.add_argument("--pull-ollama-models", action="store_true", help="Attempt to pull Ollama models via API if not found locally.")
     parser.add_argument("--benchmark-name", default="LLM Benchmark Run", help="Name for this run (used for cache file and report title).")
     parser.add_argument("--no-cache", action="store_true", help="Ignore existing cache and run fresh.")
@@ -418,7 +427,6 @@ def main():
     parser.add_argument("--export-details-json", action="store_true", help="Export detailed task results (no summaries) to a JSON file.")
     parser.add_argument("--check-dependencies", action="store_true", help="Check optional dependencies and exit.")
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging during model queries.")
-
 
     try:
         args = parser.parse_args()
@@ -461,7 +469,6 @@ def main():
         sys.exit(1)
 
     # --- Select Tasks Based on Arguments ---
-    # (Task selection logic remains the same...)
     tasks_to_run_names = set()
     if args.task_name:
         requested_names = set(args.task_name)
@@ -478,14 +485,14 @@ def main():
         if selected_task_set == "all":
             tasks_to_run_names.update(all_tasks_dict.keys())
         else:
-            category_key_map = {
-                "nlp": "General NLP", "code": "Code Generation", "other": "Other"
-            }
-            target_category = category_key_map.get(selected_task_set)
+            # Map task set names (cli args) to category names (json keys)
+            category_key_map = {"nlp": "General NLP", "code": "Code Generation", "other": "Other"}
+            # Use the mapped name or the raw arg if no mapping exists
+            target_category = category_key_map.get(selected_task_set, selected_task_set)
             if target_category and target_category in task_categories_map:
                  tasks_to_run_names.update(task_categories_map[target_category])
             else:
-                 print(f"[WARN] Task set '{args.task_set}' selected, but no runnable tasks found in category '{target_category or args.task_set.upper()}'.")
+                 print(f"[WARN] Task set '{args.task_set}' selected, but no runnable tasks found in category '{target_category}'.")
                  print("[INFO] Exiting. Check task set or tasks file.")
                  sys.exit(1)
         print(f"[INFO] Selected {len(tasks_to_run_names)} tasks based on task set '{args.task_set}'.")
@@ -496,7 +503,6 @@ def main():
          sys.exit(1)
 
     # --- Determine Final List of Models to Run ---
-    # These lists are now correctly populated by setup_runtime_config based on args
     model_list = runtime_config.models_to_benchmark # Models for general tasks
     code_model_list = runtime_config.code_models_to_benchmark # Models for code tasks
     all_models_to_run = sorted(list(set(model_list + code_model_list))) # All unique models needed
@@ -506,12 +512,21 @@ def main():
     print(f"[INFO] All unique models requiring checks/pulls ({len(all_models_to_run)}): {all_models_to_run}")
 
     # --- Check Model Availability / Pull ---
-    # (Model check logic remains the same, using all_models_to_run)
-    gemini_models_in_list = [m for m in all_models_to_run if m.startswith("gemini-") or m.startswith("models/")]
-    ollama_models_in_list = [m for m in all_models_to_run if not (m.startswith("gemini-") or m.startswith("models/"))]
+    # MODIFIED FOR VLLM
+    gemini_models_in_list = [m for m in all_models_to_run if get_provider_from_model_name(m) == "gemini"]
+    ollama_models_in_list = [m for m in all_models_to_run if get_provider_from_model_name(m) == "ollama"]
+    vllm_models_in_list = [m for m in all_models_to_run if get_provider_from_model_name(m) == "vllm"]
 
     if gemini_models_in_list and not runtime_config.gemini_key:
         print(f"[WARN] Gemini models ({gemini_models_in_list}) selected, but no API key provided. These models will be skipped.")
+
+    if vllm_models_in_list:
+        if not runtime_config.vllm_host_url:
+            print(f"[WARN] vLLM models ({vllm_models_in_list}) selected, but no vLLM host URL provided. These models will be skipped.")
+        elif not runtime_config.openai_available:
+             print(f"[WARN] vLLM models ({vllm_models_in_list}) selected, but OpenAI library not found. These models will be skipped.")
+        else:
+             print(f"[INFO] vLLM models selected. Ensure they are running on the server at {runtime_config.vllm_host_url}.")
 
     if ollama_models_in_list:
         print("[INFO] Checking availability of local Ollama models...")
@@ -520,21 +535,24 @@ def main():
             if local_ollama_models is None:
                  print("[ERROR] Could not connect to Ollama to check models. Ollama benchmarks will likely fail.")
             else:
-                missing_ollama = [m for m in ollama_models_in_list if m not in local_ollama_models]
+                # Get just the model name part for comparison
+                ollama_models_to_check = [m.split('ollama/', 1)[-1] if m.startswith('ollama/') else m for m in ollama_models_in_list]
+                missing_ollama = [m for m in ollama_models_to_check if m not in local_ollama_models]
                 if missing_ollama:
                     print(f"[WARN] Local Ollama instance is missing required models: {missing_ollama}")
                     if args.pull_ollama_models:
                         print("[INFO] Attempting to pull missing Ollama models (--pull-ollama-models enabled)...")
                         pulled_successfully = []
                         for model_to_pull in missing_ollama:
+                            # Pass the name as it appears in the list (without prefix if user didn't add it)
                             if pull_ollama_model(model_to_pull, runtime_config):
                                 pulled_successfully.append(model_to_pull)
                             else:
-                                print(f"[ERROR] Failed to pull model '{model_to_pull}'. It will be skipped if required.")
+                                print(f"[ERROR] Failed to pull Ollama model '{model_to_pull}'. It will be skipped if required.")
                             time.sleep(1)
-                        if pulled_successfully: print(f"[INFO] Pull attempt finished for: {pulled_successfully}")
+                        if pulled_successfully: print(f"[INFO] Ollama pull attempt finished for: {pulled_successfully}")
                     else:
-                        print("[INFO] Missing models will be skipped. Use --pull-ollama-models to attempt download.")
+                        print("[INFO] Missing Ollama models will be skipped. Use --pull-ollama-models to attempt download.")
                 else:
                     print("[INFO] All required Ollama models found locally.")
         except Exception as e:
@@ -551,13 +569,13 @@ def main():
         cached_results = load_cache(cache_file, runtime_config.cache_ttl)
 
     # --- Execute Benchmark ---
-    # (Benchmark execution logic remains the same, using all_models_to_run)
     results = {}
     run_reason = ""
     if cached_results:
         print("[INFO] Using cached results.")
         results = cached_results
         run_reason = "Using cache"
+        # Restore metadata if missing from cache
         if "_task_definitions" not in results: results["_task_definitions"] = all_tasks_dict
         if "_task_categories" not in results: results["_task_categories"] = task_categories_map
         if "_category_weights_used" not in results: results["_category_weights_used"] = runtime_config.category_weights
@@ -583,6 +601,7 @@ def main():
             if results and any(not k.startswith("_") and isinstance(v, dict) for k, v in results.items()):
                 print("[INFO] Computing performance scores for new results...")
                 compute_performance_scores(results, runtime_config.category_weights, runtime_config.default_category_weight)
+                # Store metadata with results
                 results["_task_definitions"] = all_tasks_dict
                 results["_task_categories"] = task_categories_map
                 results["_category_weights_used"] = runtime_config.category_weights
@@ -602,9 +621,9 @@ def main():
 
 
     # --- Generate Plots and Report ---
-    # (Reporting and Export logic remains the same...)
     report_path = None
     if results and any(not k.startswith("_") and isinstance(v, dict) for k, v in results.items()):
+        # Ensure metadata exists for reporting
         if "_task_definitions" not in results: results["_task_definitions"] = all_tasks_dict
         if "_task_categories" not in results: results["_task_categories"] = task_categories_map
         if "_category_weights_used" not in results: results["_category_weights_used"] = runtime_config.category_weights
@@ -615,16 +634,22 @@ def main():
             if runtime_config.matplotlib_available:
                 print("[INFO] Generating report visualizations...")
                 try:
+                    # Existing plots
                     plot_paths["overall_score"] = generate_ranking_plot(results, "overall_weighted_score", "Overall Score Ranking", "Score (0-100, higher better)", "overall_score_plot.png", runtime_config)
-                    plot_paths["ollama_score"] = generate_ranking_plot(results, "ollama_perf_score", "Ollama Perf Score Ranking", "Score (0-100, higher better)", "ollama_score_plot.png", runtime_config)
                     plot_paths["accuracy"] = generate_ranking_plot(results, "accuracy", "Accuracy Ranking", "Accuracy (%)", "accuracy_plot.png", runtime_config, is_percentage=True)
-                    plot_paths["tokps"] = generate_ranking_plot(results, "tokens_per_sec_avg", "Avg Tok/s Ranking (Ollama)", "Tokens/Second", "tokps_plot.png", runtime_config)
-                    plot_paths["ram"] = generate_ranking_plot(results, "delta_ram_mb", "Peak RAM Delta Ranking (Ollama)", "RAM Delta (MB, lower better)", "ram_plot.png", runtime_config, lower_is_better=True)
-                    if any(r.get('_summary',{}).get('delta_gpu_mem_mb') is not None for r in results.values() if isinstance(r, dict)):
-                        plot_paths["gpu"] = generate_ranking_plot(results, "delta_gpu_mem_mb", "Peak GPU Mem Delta Ranking (Ollama, GPU 0)", "GPU Mem Delta (MB, lower better)", "gpu_plot.png", runtime_config, lower_is_better=True)
-                    else: print("[INFO] Skipping GPU plot: No GPU memory data found in results.")
                     plot_paths["accuracy_by_stage"] = generate_ranking_plot(results, "accuracy", "Accuracy by Stage", "Accuracy (%)", "accuracy_by_stage_plot.png", runtime_config, is_percentage=True, group_by_stage=True)
                     plot_paths["overall_score_by_stage"] = generate_ranking_plot(results, "overall_weighted_score", "Overall Score by Stage", "Overall Score", "overall_score_by_stage_plot.png", runtime_config, group_by_stage=True)
+
+                    # Ollama-specific plots
+                    plot_paths["ollama_score"] = generate_ranking_plot(results, "ollama_perf_score", "Ollama Perf Score Ranking", "Score (0-100, higher better)", "ollama_score_plot.png", runtime_config)
+                    plot_paths["tokps"] = generate_ranking_plot(results, "tokens_per_sec_avg", "Avg Tok/s Ranking (Ollama)", "Tokens/Second", "tokps_plot.png", runtime_config)
+
+                    # Local provider plots (Ollama & vLLM)
+                    plot_paths["ram"] = generate_ranking_plot(results, "delta_ram_mb", "Peak RAM Delta Ranking (Local)", "RAM Delta (MB, lower better)", "ram_plot.png", runtime_config, lower_is_better=True)
+                    if any(r.get('_summary',{}).get('delta_gpu_mem_mb') is not None for r in results.values() if isinstance(r, dict)):
+                        plot_paths["gpu"] = generate_ranking_plot(results, "delta_gpu_mem_mb", "Peak GPU Mem Delta Ranking (Local, GPU 0)", "GPU Mem Delta (MB, lower better)", "gpu_plot.png", runtime_config, lower_is_better=True)
+                    else: print("[INFO] Skipping GPU plot: No GPU memory data found in results.")
+
                 except Exception as plot_err:
                      print(f"[ERROR] Failed during plot generation: {plot_err}")
                      traceback.print_exc()
@@ -653,7 +678,7 @@ def main():
     else:
         print("[INFO] Skipping report generation and export: No valid results found.")
         if run_reason != "Using cache":
-             print("[WARN] The benchmark run did not produce any results. Check model availability, API keys, and task definitions.")
+             print("[WARN] The benchmark run did not produce any results. Check model availability, API keys/URLs, and task definitions.")
 
     # --- Finalize ---
     run_duration = time.time() - run_start_time

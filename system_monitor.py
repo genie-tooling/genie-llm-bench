@@ -8,91 +8,144 @@ from llm_clients import _get_ollama_pid_via_api
 
 def get_ollama_pids(psutil_module, runtime_config):
     """Identifies PIDs for Ollama processes using psutil, with API fallback."""
-    # Args: psutil_module: The imported psutil library. runtime_config (RuntimeConfig): Config for API fallback.
-    # Returns: list: A list of potential Ollama process PIDs.
     pids = []
-    if psutil_module:
-        try:
-            NoSuchProcess = getattr(psutil_module, 'NoSuchProcess', Exception)
-            AccessDenied = getattr(psutil_module, 'AccessDenied', Exception)
+    if not psutil_module:
+        print("[WARN] psutil not available, cannot find Ollama PIDs via process iteration.")
+        # Try API fallback even if psutil isn't loaded
+        api_pid = _get_ollama_pid_via_api(runtime_config)
+        if api_pid:
+            print(f"[INFO] Found potential Ollama PID {api_pid} via API fallback (cannot verify without psutil).")
+            pids.append(api_pid)
+        return pids
 
-            for proc in psutil_module.process_iter(['pid', 'name', 'cmdline']):
-                try:
-                    if not proc.is_running(): continue
-                    info = proc.info
-                    pname = info.get('name', '').lower() if info else ''
-                    cmd = ' '.join(info.get('cmdline', [])).lower() if info and info.get('cmdline') else ''
+    # psutil is available, try process iteration first
+    try:
+        NoSuchProcess = getattr(psutil_module, 'NoSuchProcess', Exception)
+        AccessDenied = getattr(psutil_module, 'AccessDenied', Exception)
 
-                    # Match common Ollama process names/command lines
-                    # Be more specific to avoid matching unrelated processes
-                    is_ollama = False
-                    if 'ollama' in pname:
-                        is_ollama = True
-                    elif 'ollama' in cmd and ('serve' in cmd or 'run' in cmd or 'llama_server' in cmd):
-                        is_ollama = True
+        for proc in psutil_module.process_iter(['pid', 'name', 'cmdline']):
+            try:
+                if not proc.is_running(): continue
+                info = proc.info
+                pname = info.get('name', '').lower() if info else ''
+                cmd = ' '.join(info.get('cmdline', [])).lower() if info and info.get('cmdline') else ''
 
-                    if is_ollama:
-                        pid = info.get('pid') if info else None
-                        if pid and pid not in pids:
-                            pids.append(pid)
-                except (NoSuchProcess, AccessDenied):
-                    continue
-                except Exception as inner_e:
-                     print(f"[WARN] Error inspecting process {getattr(proc, 'pid', 'N/A')}: {inner_e}")
-        except Exception as e:
-            print(f"[WARN] Error iterating processes with psutil: {e}")
+                # Match common Ollama process names/command lines
+                is_ollama = False
+                if 'ollama' in pname and 'serve' in cmd: # Be more specific
+                    is_ollama = True
+                elif 'ollama' in cmd and ('serve' in cmd or '/ollama' in cmd): # Match executable path too
+                    is_ollama = True
+
+                if is_ollama:
+                    pid = info.get('pid') if info else None
+                    if pid and pid not in pids:
+                        pids.append(pid)
+            except (NoSuchProcess, AccessDenied):
+                continue
+            except Exception as inner_e:
+                 print(f"[WARN] Error inspecting process {getattr(proc, 'pid', 'N/A')} for Ollama: {inner_e}")
+    except Exception as e:
+        print(f"[WARN] Error iterating processes with psutil for Ollama: {e}")
 
     # Fallback using ollama show API if psutil fails or finds nothing
     if not pids:
-        print("[INFO] No Ollama process found via psutil, trying API fallback...")
+        print("[INFO] No Ollama process found via psutil iteration, trying API fallback...")
         api_pid = _get_ollama_pid_via_api(runtime_config)
         if api_pid:
-            if psutil_module and psutil_module.pid_exists(api_pid):
+            if psutil_module.pid_exists(api_pid):
                 print(f"[INFO] Found potential Ollama server PID {api_pid} via API and verified with psutil.")
                 pids.append(api_pid)
-            elif not psutil_module:
-                # Cannot verify, but add it anyway if psutil is unavailable
-                print(f"[INFO] Found potential PID {api_pid} via API (cannot verify without psutil).")
-                pids.append(api_pid)
             else:
-                 print(f"[WARN] PID {api_pid} from API error does not seem to exist according to psutil.")
+                 print(f"[WARN] PID {api_pid} from Ollama API error does not seem to exist according to psutil.")
         else:
-            print("[INFO] API fallback did not yield a PID.")
+            print("[INFO] Ollama API fallback did not yield a PID.")
 
     if not pids:
          print("[WARN] Could not determine Ollama process PIDs for RAM monitoring.")
     return pids
 
+# --- VLLM ADDITION START ---
+def get_vllm_pids(psutil_module, runtime_config):
+    """Identifies PIDs for vLLM server processes using psutil."""
+    pids = []
+    if not psutil_module:
+        print("[WARN] psutil not available, cannot find vLLM PIDs.")
+        return pids
+
+    # Patterns to match vLLM server launch commands
+    # These might need adjustment based on how the server is started
+    vllm_patterns = [
+        r'python.*vllm\.entrypoints\.openai\.api_server', # Common launch method
+        r'python.*vllm\.entrypoints\.api_server',         # Alternative entrypoint
+        # Add more patterns if needed (e.g., direct script execution)
+    ]
+
+    try:
+        NoSuchProcess = getattr(psutil_module, 'NoSuchProcess', Exception)
+        AccessDenied = getattr(psutil_module, 'AccessDenied', Exception)
+
+        for proc in psutil_module.process_iter(['pid', 'name', 'cmdline']):
+            try:
+                if not proc.is_running(): continue
+                info = proc.info
+                cmdline = ' '.join(info.get('cmdline', [])).lower() if info and info.get('cmdline') else ''
+
+                if not cmdline: continue # Skip processes without command line info
+
+                for pattern in vllm_patterns:
+                    if re.search(pattern, cmdline):
+                        pid = info.get('pid')
+                        if pid and pid not in pids:
+                            pids.append(pid)
+                            # Found a match for this process, no need to check other patterns for it
+                            break
+            except (NoSuchProcess, AccessDenied):
+                continue
+            except Exception as inner_e:
+                 print(f"[WARN] Error inspecting process {getattr(proc, 'pid', 'N/A')} for vLLM: {inner_e}")
+    except Exception as e:
+        print(f"[WARN] Error iterating processes with psutil for vLLM: {e}")
+
+    if not pids:
+         print("[WARN] Could not determine vLLM process PIDs for RAM monitoring. Check launch command and patterns.")
+    return pids
+# --- VLLM ADDITION END ---
+
+
 def get_combined_rss(pids, psutil_module):
     """Calculates the total RSS memory usage for a list of PIDs."""
-    # Args: pids (list): List of process IDs. psutil_module: The imported psutil library.
-    # Returns: int: Total RSS memory in bytes, or 0 if unavailable.
     if not psutil_module or not pids:
         return 0
     total_rss = 0
-    active_pids = [] # Keep track of PIDs that are still valid
+    active_pids_found = [] # Track PIDs that were successfully measured
     NoSuchProcess = getattr(psutil_module, 'NoSuchProcess', Exception)
     AccessDenied = getattr(psutil_module, 'AccessDenied', Exception)
 
     for pid in pids:
         try:
             p = psutil_module.Process(pid)
-            # Check if process is still running and accessible
-            if p.is_running():
+            if p.is_running(): # Check if running before accessing memory_info
                 mem_info = p.memory_info()
                 total_rss += mem_info.rss
-                active_pids.append(pid)
+                active_pids_found.append(pid)
         except NoSuchProcess:
-            pass # Process ended, ignore
+            if pid in active_pids_found: # If it was active before, maybe log disappearance?
+                 print(f"[INFO] Process PID {pid} disappeared during memory measurement.")
+                 active_pids_found.remove(pid)
+            # else: Process likely ended before measurement started, ignore silently
         except AccessDenied:
-            # Don't warn repeatedly for access denied
-            active_pids.append(pid) # Keep PID in case permissions change
+            print(f"[WARN] Access denied when getting memory for PID {pid}. RAM delta may be inaccurate.")
+            # Keep PID in case permissions change, but don't add to active_pids_found for *this* measurement
         except Exception as e:
             print(f"[WARN] Error getting memory for PID {pid}: {e}")
-            active_pids.append(pid) # Keep PID
+            # Keep PID, maybe temporary issue
 
-    # Note: This function doesn't modify the original PID list passed in.
-    # Caller might want to update its list based on active_pids if needed.
+    # Report if some PIDs couldn't be measured
+    if len(pids) > len(active_pids_found):
+         missed_pids = [p for p in pids if p not in active_pids_found]
+         # print(f"[INFO] Could not get memory info for PIDs: {missed_pids} (ended or access denied).")
+
     return total_rss
 
 
@@ -100,8 +153,6 @@ def get_combined_rss(pids, psutil_module):
 
 def get_gpu_memory_usage(pynvml_module, device_index=0):
     """Gets the used memory for a specific NVIDIA GPU."""
-    # Args: pynvml_module: The imported pynvml library. device_index (int): Index of the GPU.
-    # Returns: int: Used GPU memory in bytes, or 0 if unavailable/error.
     if not pynvml_module:
         return 0
     try:

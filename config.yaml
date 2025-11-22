@@ -2,27 +2,44 @@
 # Settings here provide defaults and can be overridden by command-line arguments.
 
 # --- API Configuration ---
-api_keys:
+api:
   # Gemini API Key. Can be overridden by GEMINI_API_KEY env var or --gemini-key arg.
-  gemini: "" # Recommend setting via ENV or CLI argument for security.
+  gemini_api_key: "" # Recommend setting via ENV or CLI argument for security.
+
+  # Ollama Host URL. Can be overridden by OLLAMA_HOST env var.
+  ollama_host_url: "http://localhost:11434"
+
+  # vLLM OpenAI-Compatible API Host URL. Can be overridden by VLLM_HOST env var or --vllm-host arg.
+  vllm_host_url: "http://localhost:8000/v1" # Default vLLM endpoint
+
+  # Optional: vLLM API Key if your server requires authentication
+  # vllm_api_key: ""
+
+  # Optional: Gemini Base URL (rarely needs changing)
+  # gemini_api_base: "https://generativelanguage.googleapis.com/v1beta/models/"
 
 # --- Default Models ---
 # List of models to benchmark if --test-model is not provided.
+# Use 'vllm/' prefix for models served by vLLM.
 default_models:
-  - "llama3:8b"
-  - "mistral:7b"
-  - "llama3.2:3b"
-  - "gemma3:4b"
-  - "gemini-1.5-flash-latest"
-  - "gemini-2.5-pro-preview-03-25"
-  - "huihui_ai/gemma3-abliterated:latest"
+  #- "ollama/llama3:8b" # Example using explicit provider prefix (optional, fallback is ollama)
+  #- "ollama/mistral:7b"
+  - "ollama/gemma3:12b"
+  - "ollama/Maoyue/mistral-nemo-instruct-2407"
+  - "gemma-3-12b-it"
+  # Add vLLM models here, e.g.:
+  - "vllm/google_gemma-3-12b-it-Q4_K_M"
+  # - "vllm/meta-llama/Llama-2-7b-chat-hf"
+  # - "vllm/mistralai/Mistral-7B-Instruct-v0.1"
+  # - "vllm/meta-llama/Llama-3-8B-Instruct" # Example for Llama3 on vLLM
+  # - "vllm/mistralai/Mixtral-8x7B-Instruct-v0.1" # Example for Mixtral on vLLM
+  # - "vllm/my-quantized-model-awq" # Example for a custom quantized model
 
+# Specify models specifically for code tasks (can also use vllm/ prefix)
 code_models:
-  - "networkjohnny/deepseek-coder-v2-lite-base-q4_k_m-gguf"
-  - "qwen2.5-coder:4b"
-  - "qwen2.5-coder:1.5b-base"
-  - "codegemma:2b"
-  - gemini-pro
+  - "ollama/deepseek-coder:6.7b"
+  - "gemini-1.5-flash-latest"
+  # - "vllm/codellama/CodeLlama-7b-Instruct-hf"
 
 # --- Paths ---
 # Default locations for files and directories. Can be overridden by CLI args.
@@ -34,7 +51,7 @@ paths:
 
 # --- Execution Control ---
 timeouts:
-  # Timeout for individual API requests (seconds).
+  # Timeout for individual API requests (seconds) to Ollama, Gemini, vLLM.
   request: 180
   # Timeout for executing code within a single test case (seconds).
   code_execution_per_case: 10
@@ -53,6 +70,7 @@ cache:
 # --- Scoring Weights ---
 scoring:
   # Weights for the Ollama Performance Score (should sum roughly to 1.0).
+  # This score only applies to Ollama models.
   ollama_perf_score:
     accuracy: 0.50
     tokens_per_sec: 0.30
@@ -70,8 +88,8 @@ scoring:
 # Default state for optional features. Can be overridden by CLI args
 # (--feature enable/disable).
 features:
-  ram_monitor: true # Requires 'psutil'
-  gpu_monitor: true # Requires 'pynvml' and NVIDIA GPU
+  ram_monitor: true # Requires 'psutil'. Monitors Ollama and vLLM processes.
+  gpu_monitor: true # Requires 'pynvml' and NVIDIA GPU. Monitors overall GPU usage.
   visualizations: true # Requires 'matplotlib'
   semantic_eval: true # Requires 'sentence-transformers'
 

@@ -7,8 +7,9 @@ import yaml # Now needed for loading config file
 DEFAULT_CONFIG_FILE = pathlib.Path('config.yaml')
 
 # --- Default Base URLs ---
-# These can be overridden by config.yaml or OLLAMA_HOST environment variable
+# These can be overridden by config.yaml or OLLAMA_HOST/VLLM_HOST environment variables
 DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434"
+DEFAULT_VLLM_BASE_URL = "http://localhost:8000/v1" # vLLM OpenAI-compatible endpoint
 # Gemini base URL is less likely to change but could be made configurable if needed
 DEFAULT_GEMINI_API_URL_BASE = "https://generativelanguage.googleapis.com/v1beta/models/"
 
@@ -17,7 +18,7 @@ BASE_DEFAULT_REQUEST_TIMEOUT = 180
 BASE_DEFAULT_CODE_TIMEOUT = 10
 BASE_DEFAULT_RETRIES = 2
 BASE_DEFAULT_RETRY_DELAY = 5
-BASE_DEFAULT_MODELS = ["llama3:8b"]
+BASE_DEFAULT_MODELS = ["ollama/llama3:8b"] # Default to ollama prefix for clarity
 BASE_DEFAULT_CATEGORY_WEIGHTS = {"default": 1.0}
 BASE_DEFAULT_OLLAMA_WEIGHTS = {"accuracy": 0.5, "tokens_per_sec": 0.3, "ram_efficiency": 0.2}
 BASE_DEFAULT_CONFIDENCE = 0.75
@@ -56,6 +57,7 @@ class RuntimeConfig:
         self.sentence_transformers_available = False
         self.pynvml_available = False
         self.gpu_count = 0
+        self.openai_available = False # VLLM ADDITION
 
         # Loaded Optional Modules
         self.psutil = None
@@ -67,6 +69,7 @@ class RuntimeConfig:
         self.st_util = None
         self.semantic_model = None
         self.pynvml = None
+        self.openai = None # VLLM ADDITION
 
         # Operational Settings (populated from defaults, file, env, then CLI)
         self.models_to_benchmark = list(BASE_DEFAULT_MODELS)
@@ -87,6 +90,8 @@ class RuntimeConfig:
 
         # API Endpoint URLs and Keys
         self.ollama_base_url = DEFAULT_OLLAMA_BASE_URL # Default, can be overridden
+        self.vllm_host_url = DEFAULT_VLLM_BASE_URL     # VLLM ADDITION
+        self.vllm_api_key = None                       # VLLM ADDITION
         self.gemini_api_url_base = DEFAULT_GEMINI_API_URL_BASE
         self.gemini_key = None # Must come from config/env/cli
 
@@ -113,6 +118,8 @@ class RuntimeConfig:
         api_cfg = file_cfg.get('api', {}) # Changed section name for clarity
         self.gemini_key = api_cfg.get('gemini_api_key', self.gemini_key)
         self.ollama_base_url = api_cfg.get('ollama_host_url', self.ollama_base_url)
+        self.vllm_host_url = api_cfg.get('vllm_host_url', self.vllm_host_url) # VLLM ADDITION
+        self.vllm_api_key = api_cfg.get('vllm_api_key', self.vllm_api_key)     # VLLM ADDITION
         # Allow overriding Gemini base URL too if needed
         self.gemini_api_url_base = api_cfg.get('gemini_api_base', self.gemini_api_url_base)
 
@@ -172,10 +179,25 @@ class RuntimeConfig:
         # Ollama Host (ENV overrides File)
         env_ollama_host = os.environ.get("OLLAMA_HOST")
         if env_ollama_host:
-            # Basic validation: Ensure it looks like a URL prefix
             if env_ollama_host.startswith("http://") or env_ollama_host.startswith("https://"):
-                # Remove trailing slash if present
                 self.ollama_base_url = env_ollama_host.rstrip('/')
                 print(f"[INFO] Using Ollama Host URL from OLLAMA_HOST environment variable: {self.ollama_base_url}")
             else:
                 print(f"[WARN] OLLAMA_HOST environment variable ('{env_ollama_host}') does not look like a valid URL. Ignoring.")
+
+        # --- VLLM ADDITION START ---
+        # vLLM Host (ENV overrides File)
+        env_vllm_host = os.environ.get("VLLM_HOST")
+        if env_vllm_host:
+            if env_vllm_host.startswith("http://") or env_vllm_host.startswith("https://"):
+                self.vllm_host_url = env_vllm_host.rstrip('/')
+                print(f"[INFO] Using vLLM Host URL from VLLM_HOST environment variable: {self.vllm_host_url}")
+            else:
+                print(f"[WARN] VLLM_HOST environment variable ('{env_vllm_host}') does not look like a valid URL. Ignoring.")
+
+        # vLLM API Key (ENV overrides File)
+        env_vllm_key = os.environ.get("VLLM_API_KEY")
+        if env_vllm_key:
+            self.vllm_api_key = env_vllm_key
+            print("[INFO] Using vLLM API Key from VLLM_API_KEY environment variable.")
+        # --- VLLM ADDITION END ---
