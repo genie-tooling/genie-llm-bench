@@ -1,0 +1,22 @@
+# LLM Benchmark Runner Requirements
+
+# --- Core Dependencies ---
+requests>=2.20.0         # For making API calls to Ollama/Gemini
+PyYAML>=5.0              # For loading config.yaml and YAML tasks
+openai>=1.0.0            # For making API calls to vLLM OpenAI-compatible endpoint
+vllm 
+ollama 
+google-generativeai
+
+# For CPU RAM Monitoring (--ram-monitor enable)
+psutil>=5.0.0
+
+# For NVIDIA GPU Monitoring (--gpu-monitor enable)
+pynvml>=11.0.0
+
+# For Report Visualizations (--visualizations enable)
+matplotlib>=3.0.0
+
+# For Semantic Similarity Evaluation (--semantic-eval enable)
+sentence-transformers>=2.0.0
+
