@@ -20,6 +20,9 @@ PyYAML>=5.0
 
 # For Semantic Similarity Evaluation (--semantic-eval enable)
 # sentence-transformers>=2.0.0
+# For Llama.cpp integration
+# llama-cpp-python>=0.2.0
+
 # (Note: sentence-transformers will download model files on first use)
 
 # --- For Development/Testing (Installs all optional dependencies) ---

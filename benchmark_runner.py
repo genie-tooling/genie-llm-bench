@@ -1,12 +1,14 @@
 import time
 import traceback
+import os
 from collections import defaultdict
 # Import utils functions used directly
 from utils import format_na, truncate_text
 # Import client and monitor functions
 from llm_clients import (
-    query_ollama, query_gemini, query_vllm, # --- VLLM ADDITION ---
-    get_local_ollama_models, get_ollama_running_models, unload_ollama_model
+    query_ollama, query_gemini, query_vllm, query_llamacpp, # --- VLLM ADDITION ---
+    get_local_ollama_models, get_ollama_running_models, unload_ollama_model,
+    get_provider_from_model_name
 )
 from evaluation import evaluate_response
 from system_monitor import get_ollama_pids, get_vllm_pids, get_combined_rss, get_gpu_memory_usage # --- VLLM ADDITION ---
@@ -14,19 +16,6 @@ from system_monitor import get_ollama_pids, get_vllm_pids, get_combined_rss, get
 # --- Constants ---
 UNLOAD_WAIT_SECONDS = 5 # Time to wait after unload requests before measuring RAM/GPU
 INTER_UNLOAD_DELAY = 0.5 # Small delay between unload API calls
-
-# --- Model Provider Identification ---
-def get_provider_from_model_name(model_name):
-    """Determines the provider based on model name convention."""
-    if model_name.startswith("vllm/"):
-        return "vllm"
-    elif model_name.startswith("gemini-") or model_name.startswith("models/"):
-        return "gemini"
-    elif model_name.startswith("ollama/"):
-        return "ollama"
-    else:
-        # Default assumption if no prefix
-        return "ollama"
 
 def run_benchmark_set(benchmark_name, model_list, tasks, task_categories_map, runtime_config):
     """Runs a set of tasks across specified models and collects results."""
@@ -41,7 +30,8 @@ def run_benchmark_set(benchmark_name, model_list, tasks, task_categories_map, ru
     # MODIFIED FOR VLLM: Check for any local provider (Ollama or vLLM)
     ollama_models_present = any(get_provider_from_model_name(m) == "ollama" for m in model_list)
     vllm_models_present = any(get_provider_from_model_name(m) == "vllm" for m in model_list)
-    local_provider_present = ollama_models_present or vllm_models_present
+    llamacpp_models_present = any(get_provider_from_model_name(m) == "llamacpp" for m in model_list)
+    local_provider_present = ollama_models_present or vllm_models_present or llamacpp_models_present
 
     ollama_pids = []
     vllm_pids = [] # --- VLLM ADDITION ---
@@ -163,7 +153,13 @@ def run_benchmark_set(benchmark_name, model_list, tasks, task_categories_map, ru
                  model_summary["status"] = "Skipped - No vLLM Host"
                  results[model_name_raw] = {"_summary": model_summary}
                  continue
-             # We assume the model exists on the vLLM server; API call will fail if not.
+        elif provider == "llamacpp":
+            model_path = model_name_for_api
+            if not os.path.exists(model_path):
+                print(f"  [SKIP MODEL] Llama.cpp model file not found at '{model_path}'. Skipping.")
+                model_summary["status"] = "Skipped - Model File Not Found"
+                results[model_name_raw] = {"_summary": model_summary}
+                continue
 
         # Per-Model Tracking...
         total_model_time = 0.0
@@ -217,6 +213,8 @@ def run_benchmark_set(benchmark_name, model_list, tasks, task_categories_map, ru
                 resp_text, duration_api, tokps_api, error = query_gemini(model_name_for_api, prompt, runtime_config)
             elif provider == "vllm":
                 resp_text, duration_api, tokps_api, error = query_vllm(model_name_for_api, prompt, runtime_config) # Pass cleaned name
+            elif provider == "llamacpp":
+                resp_text, duration_api, tokps_api, error = query_llamacpp(model_name_for_api, prompt, runtime_config)
             else: # Default to Ollama
                 resp_text, duration_api, tokps_api, error = query_ollama(model_name_for_api, prompt, runtime_config) # Pass cleaned name
             query_duration = time.time() - start_query_time # Use actual wall-clock time
@@ -235,8 +233,8 @@ def run_benchmark_set(benchmark_name, model_list, tasks, task_categories_map, ru
             # Process Result...
             task_result_data = {
                 "response": resp_text, "error": error, "duration": query_duration,
-                # Only store tok/s if provider is Ollama and value is valid
-                "tokens_per_sec": tokps_api if provider == "ollama" and tokps_api is not None and tokps_api > 0 else None,
+                # Only store tok/s if provider is Ollama/Llama.cpp and value is valid
+                "tokens_per_sec": tokps_api if provider in ["ollama", "llamacpp"] and tokps_api is not None and tokps_api > 0 else None,
                 "metric": None, "details": "N/A", "task_type": t_type
             }
 
@@ -285,8 +283,8 @@ def run_benchmark_set(benchmark_name, model_list, tasks, task_categories_map, ru
                     task_result_data["details"] += " (Unexpected metric type)"
                     is_pass = False
 
-                # Only accumulate tok/s for Ollama
-                if provider == "ollama" and task_result_data["tokens_per_sec"]:
+                # Only accumulate tok/s for Ollama or Llama.cpp
+                if provider in ["ollama", "llamacpp"] and task_result_data["tokens_per_sec"]:
                     sum_tokps += task_result_data["tokens_per_sec"]
                     count_tokps += 1
                     model_summary["per_type"][t_type]["tokps_sum"] += task_result_data["tokens_per_sec"]
@@ -320,7 +318,7 @@ def run_benchmark_set(benchmark_name, model_list, tasks, task_categories_map, ru
         model_summary["total_time"] = total_model_time
 
         # Provider-specific metrics
-        if provider == "ollama":
+        if provider in ["ollama", "llamacpp"]:
             if count_tokps > 0: model_summary["tokens_per_sec_avg"] = sum_tokps / count_tokps
             # RAM/GPU handled below for all local providers
 
@@ -341,8 +339,8 @@ def run_benchmark_set(benchmark_name, model_list, tasks, task_categories_map, ru
                  stats["avg_time"] = stats["time_sum"] / count if count > 0 else 0.0
                  stats["accuracy"] = (stats["correct"] / success_calls) * 100 if success_calls > 0 else 0.0
                  stats["avg_score"] = stats["score_sum"] / stats["score_count"] if stats["score_count"] > 0 else None
-                 # Only calculate avg_tokps if it's Ollama
-                 if provider == "ollama" and stats["tokps_count"] > 0:
+                 # Only calculate avg_tokps if it's Ollama or Llama.cpp
+                 if provider in ["ollama", "llamacpp"] and stats["tokps_count"] > 0:
                      stats["avg_tokps"] = stats["tokps_sum"] / stats["tokps_count"]
                  else:
                      stats["avg_tokps"] = None
@@ -359,7 +357,7 @@ def run_benchmark_set(benchmark_name, model_list, tasks, task_categories_map, ru
             print(f"    Avg Score (on {tasks_with_scores} scored tasks): {model_summary['partial_score_avg']:.1f}%")
         print(f"    Avg Time/Task: {model_summary['avg_time_per_task']:.2f}s (Total: {total_model_time:.1f}s)")
         # Provider-specific print
-        if provider == "ollama":
+        if provider in ["ollama", "llamacpp"]:
             print(f"    Avg Tok/s (on {count_tokps} tasks): {format_na(model_summary['tokens_per_sec_avg'], precision=1)}")
         # RAM/GPU print for local providers
         if provider in ["ollama", "vllm"]:

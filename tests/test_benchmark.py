@@ -33,7 +33,7 @@ import scoring
 import cache_manager
 import reporting
 import benchmark_cli # Import the module itself for testing main entry point
-from benchmark_runner import run_benchmark_set, get_provider_from_model_name # Import specific functions if needed
+from llm_clients import get_provider_from_model_name
 
 # --- Constants for Tests ---
 TEST_MODEL_OLLAMA = "ollama/test-ollama-model:latest" # Use prefix for clarity

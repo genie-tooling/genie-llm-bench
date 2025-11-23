@@ -8,6 +8,25 @@ import re
 import traceback
 import openai # --- VLLM ADDITION ---
 
+try:
+    from llama_cpp import Llama
+except ImportError:
+    Llama = None
+
+def get_provider_from_model_name(model_name):
+    """Determines the provider based on model name convention."""
+    if model_name.startswith("vllm/"):
+        return "vllm"
+    elif model_name.startswith("gemini-") or model_name.startswith("models/"):
+        return "gemini"
+    elif model_name.startswith("ollama/"):
+        return "ollama"
+    elif model_name.startswith("llamacpp/"):
+        return "llamacpp"
+    else:
+        # Default assumption if no prefix
+        return "ollama"
+
 # Constants like specific API paths (relative to base URL)
 OLLAMA_GENERATE_PATH = "/api/generate"
 OLLAMA_MODELS_PATH = "/api/tags"
@@ -394,6 +413,61 @@ def query_vllm(model_name, prompt, runtime_config):
 
     return generated_text, duration, tokens_per_sec, final_error
 # --- VLLM ADDITION END ---
+
+
+def query_llamacpp(model_name, prompt, runtime_config):
+    """Sends a prompt to a local Llama.cpp model."""
+    if Llama is None:
+        return "", 0.0, None, "llama-cpp-python is not installed. Please install it to use Llama.cpp models."
+
+    model_path = model_name.split('llamacpp/', 1)[-1]
+    if not model_path:
+        return "", 0.0, None, "Invalid Llama.cpp model name. It should be in the format 'llamacpp/path/to/model.gguf'."
+
+    try:
+        llm = Llama(
+            model_path=model_path,
+            n_ctx=runtime_config.llamacpp_n_ctx,
+            n_gpu_layers=runtime_config.llamacpp_n_gpu_layers,
+            verbose=runtime_config.verbose,
+        )
+    except Exception as e:
+        return "", 0.0, None, f"Failed to load Llama.cpp model: {e}"
+
+    payload = {
+        "prompt": prompt,
+        "max_tokens": runtime_config.llamacpp_max_tokens,
+        "temperature": 0.0,
+    }
+
+    if runtime_config.verbose:
+        print(f"    [Verbose] Llama.cpp Payload: {json.dumps(payload, indent=2)}")
+
+    generated_text = ""
+    duration = 0.0
+    tokens_per_sec = None
+    final_error = None
+    start_time = time.time()
+
+    try:
+        response = llm.create_completion(**payload)
+        duration = time.time() - start_time
+        generated_text = response["choices"][0]["text"].strip()
+        generated_text = re.sub(r'^```[a-zA-Z]*(?:\n)?|(?:\n)?```$', '', generated_text).strip()
+        
+        usage = response.get("usage", {})
+        completion_tokens = usage.get("completion_tokens", 0)
+        if duration > 0 and completion_tokens > 0:
+            tokens_per_sec = completion_tokens / duration
+
+    except Exception as e:
+        final_error = f"Unexpected error during Llama.cpp query: {type(e).__name__}: {e}"
+        if runtime_config.verbose:
+            traceback.print_exc()
+
+    return generated_text, duration, tokens_per_sec, final_error
+
+
 
 
 def pull_ollama_model(model_name, runtime_config):

@@ -16,7 +16,7 @@ authors = [
     { name = "Your Name / Organization", email = "your_email@example.com" },
     # Add other contributors if desired
 ]
-requires-python = "<=3.13" # Specify minimum Python version
+requires-python = ">=3.10,<=3.13" # Specify minimum Python version
 
 # Core runtime dependencies needed for basic operation
 dependencies = [

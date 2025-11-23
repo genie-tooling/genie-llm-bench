@@ -2,13 +2,13 @@
 
 [![CI Tests](https://github.com/colonelpanik/llm-bench/actions/workflows/python-test.yml/badge.svg)](https://github.com/colonelpanik/llm-bench/actions/workflows/python-test.yml)
 
-A command-line tool to benchmark local (Ollama, vLLM) and remote (Google Gemini) Large Language Models (LLMs). It evaluates models against a configurable set of tasks, monitors system resources, generates a detailed HTML report with performance visualizations, and supports exporting results.
+A command-line tool to benchmark local (Ollama, vLLM, Llama.cpp) and remote (Google Gemini) Large Language Models (LLMs). It evaluates models against a configurable set of tasks, monitors system resources, generates a detailed HTML report with performance visualizations, and supports exporting results.
 
 This project is designed specifically to help a specific project with testing and benchmarking use cases, scenarios, and prompting styles for use in its own engine. I hope you find it useful for yourself.
 
 ## Features
 
-*   **Multi-Provider Support:** Benchmark models served locally via [Ollama](https://ollama.com/), [vLLM](https://github.com/vllm-project/vllm) (OpenAI-compatible API), and remotely via the Google Gemini API.
+*   **Multi-Provider Support:** Benchmark models served locally via [Ollama](https://ollama.com/), [vLLM](https://github.com/vllm-project/vllm) (OpenAI-compatible API), [Llama.cpp](https://github.com/ggerganov/llama.cpp) (direct file access), and remotely via the Google Gemini API.
 *   **Flexible Task Definition:** Define benchmark tasks in a simple JSON format (`benchmark_tasks.json`), organized by category. Includes tasks with varied prompts (e.g., different instructions, personas).
 *   **Configuration File:** Manage default settings (models, paths, API keys/URLs, weights, features, timeouts) via a `config.yaml` file. CLI arguments and environment variables override file settings.
 *   **Diverse Evaluation Methods:**
@@ -22,10 +22,10 @@ This project is designed specifically to help a specific project with testing an
 *   **Resource Monitoring (Optional):**
     *   Track CPU RAM usage delta for local models (Ollama, vLLM) (requires `psutil`).
     *   Track NVIDIA GPU memory usage delta (GPU 0) for local models (requires `pynvml`).
-*   **Performance Metrics:** Measure API response time (latency) for all providers and tokens/second (Ollama only).
+*   **Performance Metrics:** Measure API response time (latency) for all providers and tokens/second (Ollama and Llama.cpp).
 *   **Scoring:** Calculates overall accuracy, average scores for partial credit tasks, an "Ollama Performance Score" (Ollama only), and a category-weighted "Overall Score".
 *   **Reporting:**
-    *   Generates a comprehensive HTML report with summary tables, performance plots (rankings for scores, accuracy, token/sec (Ollama), resource usage, comparison by prompt stage), and detailed per-task results.
+    *   Generates a comprehensive HTML report with summary tables, performance plots (rankings for scores, accuracy, token/sec, resource usage, comparison by prompt stage), and detailed per-task results.
     *   Optional export of summary results to CSV (`--export-summary-csv`).
     *   Optional export of detailed task results to JSON (`--export-details-json`).
 *   **Caching:** Caches results to speed up subsequent runs (configurable TTL).
@@ -57,6 +57,7 @@ This project is designed specifically to help a specific project with testing an
 
 4.  **Install Optional Dependencies (As Needed):**
     Install libraries for features you intend to use. See `requirements.txt` for details.
+    *   **Llama.cpp Provider:** `pip install llama-cpp-python`
     *   **RAM Monitoring (`--ram-monitor enable`):** `pip install psutil`
     *   **GPU Monitoring (`--gpu-monitor enable`):** `pip install pynvml` (Requires NVIDIA drivers/CUDA toolkit correctly installed)
     *   **Report Plots (`--visualizations enable`):** `pip install matplotlib`
@@ -72,7 +73,7 @@ This project is designed specifically to help a specific project with testing an
 Settings are determined in the following order (later steps override earlier ones):
 
 1.  **Base Defaults:** Hardcoded minimal defaults in `config.py`.
-2.  **`config.yaml`:** Settings loaded from the YAML configuration file (default: `config.yaml`, path configurable via `--config-file`). **This is the primary place to set your defaults.** Includes `api.ollama_host_url`, `api.vllm_host_url`, `api.gemini_api_key`, etc.
+2.  **`config.yaml`:** Settings loaded from the YAML configuration file (default: `config.yaml`, path configurable via `--config-file`). **This is the primary place to set your defaults.** Includes `api.ollama_host_url`, `api.vllm_host_url`, `api.gemini_api_key`, `llamacpp` settings, etc.
 3.  **Environment Variables:**
     *   `GEMINI_API_KEY` overrides `api.gemini_api_key` from `config.yaml`.
     *   `OLLAMA_HOST` overrides `api.ollama_host_url` from `config.yaml`.
@@ -84,6 +85,7 @@ Settings are determined in the following order (later steps override earlier one
 
 *   **Ollama:** Models specified without a prefix (e.g., `llama3:8b`) or with `ollama/` prefix (e.g., `ollama/llama3:8b`).
 *   **vLLM:** Models specified with `vllm/` prefix (e.g., `vllm/meta-llama/Llama-2-7b-chat-hf`). The part after the prefix is passed to the vLLM server.
+*   **Llama.cpp:** Models specified with `llamacpp/` prefix, followed by the **full path** to a local `.gguf` model file (e.g., `llamacpp//path/to/model.gguf`).
 *   **Gemini:** Models specified with `gemini-` prefix (e.g., `gemini-1.5-flash-latest`) or `models/` prefix.
 
 ## Usage
@@ -100,11 +102,12 @@ python -m benchmark_cli --help
 python -m benchmark_cli
 ```
 
-**Run specific models (Ollama, vLLM, Gemini), overriding config defaults, clear cache:**
+**Run specific models (Ollama, vLLM, Llama.cpp, Gemini), overriding config defaults, clear cache:**
 ```bash
 python -m benchmark_cli \
   --test-model ollama/llama3:8b \
   --test-model vllm/meta-llama/Llama-3-8B-Instruct \
+  --test-model llamacpp//path/to/your/model.gguf \
   --test-model gemini-1.5-flash-latest \
   --clear-cache -v
 ```
@@ -146,7 +149,7 @@ python -m benchmark_cli --check-dependencies
 
 ## Configuration Files
 
-*   **`config.yaml` (Default):** Define default models, API endpoints (`ollama_host_url`, `vllm_host_url`, `gemini_api_key`), paths, weights, timeouts, feature toggles, etc. See the default file for structure and comments.
+*   **`config.yaml` (Default):** Define default models, API endpoints (`ollama_host_url`, `vllm_host_url`, `gemini_api_key`), `llamacpp` settings, paths, weights, timeouts, feature toggles, etc. See the default file for structure and comments.
 *   **`benchmark_tasks.json` (Default):** Define your benchmark tasks here. Path configurable in `config.yaml` or via `--tasks-file`.
 *   **`report_template.html` (Default):** Customize the HTML report template. Path configurable in `config.yaml` or via `--template-file`.
 
@@ -189,9 +192,12 @@ Running the benchmark requires connecting the container to your running Ollama a
       -v ./benchmark_tasks.json:/app/benchmark_tasks.json \
       -v ./benchmark_report:/app/benchmark_report \
       -v ./benchmark_cache:/app/benchmark_cache \
+      # Mount your models directory to access Llama.cpp files
+      -v /path/to/your/models:/models \
       llm-bench \
       --test-model ollama/llama3:8b \
-      --test-model vllm/meta-llama/Llama-3-8B-Instruct
+      --test-model vllm/meta-llama/Llama-3-8B-Instruct \
+      --test-model llamacpp//models/your_model.gguf
     ```
     *(Note: `--open-report` might not work reliably from within Docker unless you have a browser configured.)*
 
@@ -204,11 +210,13 @@ Running the benchmark requires connecting the container to your running Ollama a
           -v ./benchmark_tasks.json:/app/benchmark_tasks.json \
           -v ./benchmark_report:/app/benchmark_report \
           -v ./benchmark_cache:/app/benchmark_cache \
+          -v /path/to/your/models:/models \
           -e OLLAMA_HOST="http://host.docker.internal:11434" \
           -e VLLM_HOST="http://host.docker.internal:8000/v1" \
           llm-bench \
           --test-model ollama/llama3:8b \
-          --test-model vllm/meta-llama/Llama-3-8B-Instruct
+          --test-model vllm/meta-llama/Llama-3-8B-Instruct \
+          --test-model llamacpp//models/your_model.gguf
         ```
 
     *   **Modifying `config.yaml`:** Update `api.ollama_host_url` and `api.vllm_host_url` in your mounted `config.yaml` to point to `http://host.docker.internal:PORT`.

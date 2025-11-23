@@ -45,6 +45,15 @@ def check_dependencies(check_runtime_config):
         lib_status['openai'] = False
         # Don't mark all_ok as False, as vLLM might not be used
 
+    # Check Llama.cpp
+    try:
+        from llama_cpp import Llama
+        print("[ OK ] llama-cpp-python: Found (Required for Llama.cpp provider)")
+        lib_status['llamacpp'] = True
+    except ImportError:
+        print("[WARN] llama-cpp-python: Not Found (Required for Llama.cpp provider. Install: pip install llama-cpp-python)")
+        lib_status['llamacpp'] = False
+
     # Check PyYAML (Required for config, needed for YAML tasks)
     try:
         import yaml
@@ -230,6 +239,15 @@ def setup_runtime_config(args, loaded_file_config):
         print("[WARN] OpenAI library not found. vLLM provider will be unavailable. Run: pip install openai")
         cfg.openai_available = False
 
+    try:
+        from llama_cpp import Llama
+        cfg.llamacpp = Llama
+        cfg.llamacpp_available = True
+        print("[INFO] Llama.cpp library imported successfully.")
+    except ImportError:
+        print("[WARN] llama-cpp-python not found. Llama.cpp provider will be unavailable. Run: pip install llama-cpp-python")
+        cfg.llamacpp_available = False
+
     if cfg.ram_monitor_enabled:
         try:
             import psutil
@@ -396,10 +414,10 @@ def load_and_validate_tasks(tasks_file, runtime_config):
 def main():
     # --- Argument Parsing ---
     parser = argparse.ArgumentParser(
-        description="LLM Benchmark Runner - Evaluate local (Ollama, vLLM) and remote (Gemini) LLMs.", # MODIFIED FOR VLLM
+        description="LLM Benchmark Runner - Evaluate local (Ollama, vLLM, Llama.cpp) and remote (Gemini) LLMs.", # MODIFIED FOR VLLM
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--config-file", default=config.DEFAULT_CONFIG_FILE, type=pathlib.Path, help="Path to the YAML configuration file.")
-    parser.add_argument("--test-model", action="append", help="Specify model name (e.g., 'ollama/llama3:8b', 'vllm/model-id', 'gemini-x'). Use prefix or rely on config. Use multiple times. Overrides config file defaults for ALL tasks unless --code-model is also used.")
+    parser.add_argument("--test-model", action="append", help="Specify model name (e.g., 'ollama/llama3:8b', 'vllm/model-id', 'llamacpp/path/to/model.gguf', 'gemini-x'). Use prefix or rely on config. Use multiple times. Overrides config file defaults for ALL tasks unless --code-model is also used.")
     parser.add_argument("--code-model", action="append", help="Specify model name ONLY for code tasks. Overrides config file 'code_models'. Use multiple times.")
     parser.add_argument("--task-set", choices=["all", "nlp", "code", "other"], default="all", help="Which category of tasks to run (uses category keys in tasks file).")
     parser.add_argument("--task-name", action="append", help="Run ONLY specific tasks by name. Use multiple times. Overrides --task-set.")
@@ -516,9 +534,17 @@ def main():
     gemini_models_in_list = [m for m in all_models_to_run if get_provider_from_model_name(m) == "gemini"]
     ollama_models_in_list = [m for m in all_models_to_run if get_provider_from_model_name(m) == "ollama"]
     vllm_models_in_list = [m for m in all_models_to_run if get_provider_from_model_name(m) == "vllm"]
+    llamacpp_models_in_list = [m for m in all_models_to_run if get_provider_from_model_name(m) == "llamacpp"]
 
     if gemini_models_in_list and not runtime_config.gemini_key:
         print(f"[WARN] Gemini models ({gemini_models_in_list}) selected, but no API key provided. These models will be skipped.")
+    
+    if llamacpp_models_in_list:
+        print("[INFO] Checking availability of local Llama.cpp models...")
+        for model_path in llamacpp_models_in_list:
+            model_file = model_path.split('llamacpp/', 1)[-1]
+            if not os.path.exists(model_file):
+                print(f"[WARN] Llama.cpp model file not found at '{model_file}'. This model will be skipped.")
 
     if vllm_models_in_list:
         if not runtime_config.vllm_host_url:

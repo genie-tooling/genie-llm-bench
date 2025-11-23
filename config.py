@@ -58,6 +58,7 @@ class RuntimeConfig:
         self.pynvml_available = False
         self.gpu_count = 0
         self.openai_available = False # VLLM ADDITION
+        self.llamacpp_available = False
 
         # Loaded Optional Modules
         self.psutil = None
@@ -70,6 +71,8 @@ class RuntimeConfig:
         self.semantic_model = None
         self.pynvml = None
         self.openai = None # VLLM ADDITION
+        self.llamacpp = None
+
 
         # Operational Settings (populated from defaults, file, env, then CLI)
         self.models_to_benchmark = list(BASE_DEFAULT_MODELS)
@@ -94,6 +97,11 @@ class RuntimeConfig:
         self.vllm_api_key = None                       # VLLM ADDITION
         self.gemini_api_url_base = DEFAULT_GEMINI_API_URL_BASE
         self.gemini_key = None # Must come from config/env/cli
+
+        # Llama.cpp specific settings
+        self.llamacpp_n_ctx = 4096
+        self.llamacpp_n_gpu_layers = 0
+        self.llamacpp_max_tokens = 1024
 
         self.verbose = False
 
@@ -122,6 +130,12 @@ class RuntimeConfig:
         self.vllm_api_key = api_cfg.get('vllm_api_key', self.vllm_api_key)     # VLLM ADDITION
         # Allow overriding Gemini base URL too if needed
         self.gemini_api_url_base = api_cfg.get('gemini_api_base', self.gemini_api_url_base)
+
+        # Llama.cpp settings
+        llamacpp_cfg = file_cfg.get('llamacpp', {})
+        self.llamacpp_n_ctx = int(llamacpp_cfg.get('n_ctx', self.llamacpp_n_ctx))
+        self.llamacpp_n_gpu_layers = int(llamacpp_cfg.get('n_gpu_layers', self.llamacpp_n_gpu_layers))
+        self.llamacpp_max_tokens = int(llamacpp_cfg.get('max_tokens', self.llamacpp_max_tokens))
 
         # Models
         if 'default_models' in file_cfg and isinstance(file_cfg['default_models'], list):

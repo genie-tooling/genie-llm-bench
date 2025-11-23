@@ -7,6 +7,7 @@ openai>=1.0.0            # For making API calls to vLLM OpenAI-compatible endpoi
 vllm 
 ollama 
 google-generativeai
+llama-cpp-python
 
 # For CPU RAM Monitoring (--ram-monitor enable)
 psutil>=5.0.0

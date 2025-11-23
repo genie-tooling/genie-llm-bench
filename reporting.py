@@ -10,6 +10,7 @@ import pathlib
 import csv # Added for CSV export
 
 from utils import format_na, truncate_text
+from llm_clients import get_provider_from_model_name
 # Conditional import handled in CLI, check flag here
 # import matplotlib.pyplot as plt
 # import matplotlib.ticker as mticker
@@ -423,11 +424,3 @@ def open_report_auto(report_path):
         webbrowser.open(report_uri)
     except Exception as e:
         print(f"[WARN] Could not auto-open report: {e}\n      Report is at: {report_path.resolve()}")
-
-# --- Helper for Provider Identification (used locally) ---
-def get_provider_from_model_name(model_name):
-    """Determines the provider based on model name convention."""
-    if model_name.startswith("vllm/"): return "vllm"
-    elif model_name.startswith("gemini-") or model_name.startswith("models/"): return "gemini"
-    elif model_name.startswith("ollama/"): return "ollama"
-    else: return "ollama" # Default assumption
